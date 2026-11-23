@@ -848,7 +848,7 @@ export function findDocumentationDrift(doc: string): string[] {
 
 // ── Fingerprint ──────────────────────────────────────────────────────────────
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object")
     return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -1052,6 +1052,19 @@ export type ReleaseFindingCode =
   | "EVIDENCE_INVALID"
   | "EVIDENCE_UNKNOWN_GATE"
   | "EVIDENCE_SECRET_SHAPED"
+  | "EVIDENCE_INVALID_REVISION"
+  | "EVIDENCE_MISSING_REVISION"
+  | "EVIDENCE_MIXED_REVISION"
+  | "EVIDENCE_REVISION_MISMATCH"
+  | "EVIDENCE_MISSING_RESULT"
+  | "EVIDENCE_COMMAND_MISSING"
+  | "EVIDENCE_COMMAND_MISMATCH"
+  | "EVIDENCE_SCHEMA_IDENTITY_MISMATCH"
+  | "EVIDENCE_ARTIFACT_PATH_INVALID"
+  | "EVIDENCE_ARTIFACT_MISSING"
+  | "EVIDENCE_ARTIFACT_DIGEST_INVALID"
+  | "EVIDENCE_ARTIFACT_DIGEST_MISMATCH"
+  | "EVIDENCE_ARTIFACT_DIGEST_MISSING"
   | "GATE_FAILED"
   | "GATE_MISSING_EVIDENCE"
   | "GATE_NOT_EVIDENCED";
@@ -1310,9 +1323,14 @@ export function formatReleaseReadinessReport(
  * findings only. No timestamps (unless the caller stamps one) and no evidence
  * text, so two runs over the same inputs are byte-identical.
  */
+export interface BuildReleaseRecordOptions {
+  recordedAt?: string;
+  evidenceManifest?: Record<string, unknown>;
+}
+
 export function buildReleaseRecord(
   report: ReleaseReadinessReport,
-  options: { recordedAt?: string } = {},
+  options: BuildReleaseRecordOptions = {},
 ): Record<string, unknown> {
   const record: Record<string, unknown> = {
     schemaVersion: RELEASE_READINESS_SCHEMA_VERSION,
@@ -1337,6 +1355,8 @@ export function buildReleaseRecord(
     })),
   };
   if (options.recordedAt) record.recordedAt = options.recordedAt;
+  if (options.evidenceManifest)
+    record.evidenceManifest = options.evidenceManifest;
   return record;
 }
 

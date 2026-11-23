@@ -63,6 +63,8 @@ remediation command. They never include row data, addresses, or secrets.
 
 `npm run report:support-bundle` (and `npm run report:support-bundle -- --json` or `--out <file>`) packages the offline schema snapshot fingerprint and drift report alongside contract Wasm digests and release readiness validation into a reproducible, deterministic bundle. Like the snapshot gate, it reads only public committed artifacts, never accesses `process.env` or a live database, and scrubs secret-shaped strings.
 
+The funded-release evidence manifest (`npm run verify:release-readiness -- --manifest <file>`) also pins this snapshot's `schemaVersion`, `hashAlgorithm`, `source` and `fingerprint`, together with the release readiness fingerprint, in its `schemaIdentity`. A manifest recorded before a schema snapshot change is refused with `EVIDENCE_SCHEMA_IDENTITY_MISMATCH`; regenerate it on the released revision.
+
 ## Release, rollback, artifact, and environment
 
 - **Release.** CI runs `npm run check:schema-snapshot` before typecheck. A failing
