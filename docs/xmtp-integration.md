@@ -211,6 +211,17 @@ Every failing state also sets `failure` (an `XmtpFailure` from `lib/xmtp/failure
 - The hub reports wallet message-signing capability separately from XMTP transport state. A wallet that cannot sign the one-time XMTP identity setup is not reported as a transport outage.
 - Privacy boundary: message text is end-to-end encrypted and sent through XMTP, not received or stored by Mimir. XMTP may retain encrypted messages; duel state and wallet addresses remain public on-chain, and the peer can read sent messages.
 
+**Account changes and private content (#937)**
+
+| Rule | Implementation |
+|------|----------------|
+| Rows fetched for one account never render for another, including while the next fetch is in flight | `lib/xmtp/messages-hub-state.ts` — `messagesHubVisibleThreads` |
+| The thread panel renders only while the selected private context still belongs to the connected account and has not passed its expiry | `lib/xmtp/messages-hub-state.ts` — `resolveMessagesHubPrivateContext`; gate in `components/xmtp/MessagesHub.tsx` |
+| Drafts are scoped per account and peer | `lib/xmtp/draft-store.ts` — `mimir.xmtp.draft.v1:<wallet>:<peer>` |
+| Failure fixtures are deterministic | `tests/fixtures/xmtp/message-hub-failures.ts`, `tests/node/messages-hub-failures.test.ts` |
+
+A wallet switch does not unmount the hub, so the previous account's rows are derived away instead of being cleared in an effect: `messagesHubVisibleThreads` returns nothing unless the loaded rows carry the current address. The private-context check runs before rendering `VsXmtpPanel` (the only place message bodies appear), so an account switch hides the panel even if the selection state has not been reset yet. The same fixtures cover each transport outcome and an expired context.
+
 ## 12. Step 7 — Done ✓ (optimistic send)
 
 | Deliverable | Location |
