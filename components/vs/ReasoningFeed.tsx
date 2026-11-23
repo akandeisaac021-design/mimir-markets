@@ -29,6 +29,7 @@ import {
 } from "@/lib/reasoning/feed-view";
 import { agentOptions, type AgentNames } from "@/lib/reasoning/agent-label";
 import ResearchSourceCitations from "@/components/research/ResearchSourceCitations";
+import { createCitationFetchGuard, isAbortError } from "@/lib/research/citation-fetch-guard";
 
 const REFRESH_MS = 30_000;
 
@@ -37,8 +38,10 @@ export default function ReasoningFeed({
   agentNames,
 }: { claimId: number; agentNames?: AgentNames }) {
   const t = useTranslations("reasoningFeed");
-  const [items, setItems] = useState<FeedItem[]>([]);
-  const [loaded, setLoaded] = useState(false);
+  // Items are stored with the market they were fetched for. When `claimId`
+  // changes, the previous market's items no longer match and are hidden at
+  // once instead of lingering under the new market until its fetch lands.
+  const [feed, setFeed] = useState<{ claimId: number; items: FeedItem[] } | null>(null);
   const [agentId, setAgentId] = useState<string>("");
   const [track, setTrack] = useState<string>("");
   // Rendered client-side from a server timestamp, so freshness is computed once per
@@ -47,30 +50,42 @@ export default function ReasoningFeed({
 
   useEffect(() => {
     if (claimId <= 0) return;
-    let cancelled = false;
+    const guard = createCitationFetchGuard();
 
     async function load() {
+      const ticket = guard.begin({ marketId: claimId });
       try {
-        const res = await fetch(`/api/vs/${claimId}/reasoning`, { cache: "no-store" });
+        const res = await fetch(`/api/vs/${claimId}/reasoning`, {
+          cache: "no-store",
+          signal: ticket.signal,
+        });
         const data = (await res.json()) as { items?: FeedItem[] };
-        if (cancelled) return;
-        setItems(Array.isArray(data.items) ? data.items : []);
+        if (!ticket.isCurrent()) return;
+        setFeed({ claimId, items: Array.isArray(data.items) ? data.items : [] });
         setNowMs(Date.now());
-      } catch {
-        // A missing feed is not a broken market page.
-        if (!cancelled) setItems([]);
-      } finally {
-        if (!cancelled) setLoaded(true);
+      } catch (error) {
+        // A superseded request is not a failure; a missing feed is not a broken
+        // market page.
+        if (isAbortError(error) || !ticket.isCurrent()) return;
+        setFeed({ claimId, items: [] });
       }
     }
 
     load();
     const timer = setInterval(load, REFRESH_MS);
     return () => {
-      cancelled = true;
+      guard.dispose();
       clearInterval(timer);
     };
   }, [claimId]);
+
+  const loaded = feed !== null && feed.claimId === claimId;
+  const items = useMemo(() => (loaded ? feed.items : []), [loaded, feed]);
+  const citationScope = useMemo(() => ({ marketId: claimId }), [claimId]);
+  const resultScope = useMemo(
+    () => (feed ? { marketId: feed.claimId } : null),
+    [feed],
+  );
 
   const view = useMemo(
     () => buildFeedView(items, { agentId: agentId || undefined, track: track || undefined }),
@@ -180,6 +195,8 @@ export default function ReasoningFeed({
                             freshnessSeconds: ref.freshnessSeconds,
                           }))}
                           nowMs={nowMs}
+                          currentScope={citationScope}
+                          resultScope={resultScope}
                         />
                       </div>
                     ) : (
