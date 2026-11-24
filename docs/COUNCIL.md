@@ -215,6 +215,35 @@ Replaying captured ballots against the recorded revision reproduces the
 original result deterministically; ballots are never re-scored under a
 newer policy default.
 
+### Agreement percentage and sample size
+
+Displayed council agreement percentages always pair the percentage with the
+valid eligible vote sample size (`n`) and explicitly distinguish an absent
+ballot from `0%` agreement:
+
+- **Denominator:** Only valid, deduplicated, eligible votes enter `sampleSize`.
+  `invalid`, `stale`, `duplicated`, `cancelled`, `paused`, `expired`,
+  `equivocation`, `dependency_failure`, `deadline_abstention`, ineligible
+  voters (outside `eligibleVoteSet` / `eligiblePersonas`), and below-threshold
+  peer ballots are excluded from the denominator.
+- **Absent ballot vs zero agreement:**
+  - When `sampleSize === 0` (empty ballot or all attempts excluded), `status`
+    is `"absent_ballot"`, `agreementPct` is `null`, and `display` renders
+    `No ballot (n=0)`.
+  - When `sampleSize > 0` and no valid eligible vote agrees with the target
+    verdict (or all valid eligible votes are non-decisive `DRAW` /
+    `UNRESOLVABLE` / `abstain`), `status` is `"measured"`, `agreementPct` is
+    `0`, and `display` renders `0% (0/3, n=3)`.
+  - When `sampleSize > 0` with agreeing votes, `display` renders e.g.
+    `75% (3/4, n=4)`.
+- **Interfaces:**
+  - `lib/council/quorum.ts`: `summarizeCouncilAgreement`,
+    `formatAgreementWithSampleSize`, and `QuorumEvaluation.sampleSize` /
+    `QuorumEvaluation.agreement`.
+  - `agents/council/shared/peer-reasoning.ts`: `summarizePeerBallotAgreement`
+    and `PolicyDecision` (`sampleSize`, `agreementPct`, `agreementDisplay` from
+    `runPolicyComparison`).
+
 ---
 
 ## Council policy comparison runner
