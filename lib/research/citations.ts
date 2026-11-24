@@ -96,6 +96,41 @@ export interface BuildResearchCitationsOptions {
   nowMs?: number;
   /** When true, treat the whole list as cancelled (e.g. cancelled market). */
   cancelled?: boolean;
+  /**
+   * Binds the rows to the market and source revision they were fetched for.
+   * When `resultScope` is given and does not match `currentScope`, the result
+   * is stale (the selected market or its sources changed while the fetch was
+   * in flight) and the view is reported as `cancelled` with no rows, so one
+   * market's evidence never renders under another market's header. Omit both
+   * to keep the previous, unbound behavior.
+   */
+  currentScope?: CitationScope | null;
+  resultScope?: CitationScope | null;
+}
+
+/** The market (and optional source revision) a citation result belongs to. */
+export interface CitationScope {
+  marketId: string | number;
+  /** Source revision, e.g. a context-pack hash or `updatedAt`; null when unknown. */
+  revision?: string | number | null;
+}
+
+function scopeKey(scope: CitationScope): string {
+  return `${String(scope.marketId)}\u0000${scope.revision == null ? "" : String(scope.revision)}`;
+}
+
+/**
+ * True when a fetched citation result still belongs to the selected market and
+ * source revision. A missing result scope (legacy callers) counts as current;
+ * a result scope with no current scope does not, because nothing is selected.
+ */
+export function isCitationScopeCurrent(
+  currentScope: CitationScope | null | undefined,
+  resultScope: CitationScope | null | undefined,
+): boolean {
+  if (resultScope == null) return true;
+  if (currentScope == null) return false;
+  return scopeKey(currentScope) === scopeKey(resultScope);
 }
 
 const WALLET_LIKE =
@@ -303,9 +338,11 @@ export function buildResearchCitations(
     maxAgeSeconds = null,
     nowMs = Date.now(),
     cancelled = false,
+    currentScope = null,
+    resultScope = null,
   } = options;
 
-  if (cancelled) {
+  if (cancelled || !isCitationScopeCurrent(currentScope, resultScope)) {
     return {
       status: "cancelled",
       statusMessageKey: "cancelled",

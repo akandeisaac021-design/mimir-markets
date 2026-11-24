@@ -50,6 +50,8 @@ export default function ResearchSourceCitations({
   maxAgeSeconds = null,
   nowMs,
   cancelled = false,
+  currentScope = null,
+  resultScope = null,
   className = "",
   title,
 }: ResearchSourceCitationsProps) {
@@ -71,8 +73,10 @@ export default function ResearchSourceCitations({
         maxAgeSeconds,
         nowMs,
         cancelled,
+        currentScope,
+        resultScope,
       }),
-    [sources, deadlineUnix, maxAgeSeconds, nowMs, cancelled],
+    [sources, deadlineUnix, maxAgeSeconds, nowMs, cancelled, currentScope, resultScope],
   );
 
   const showRows = researchCitationsShowsRows(view);
