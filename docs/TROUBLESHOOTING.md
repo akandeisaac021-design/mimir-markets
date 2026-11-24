@@ -377,6 +377,16 @@ When `estimateStale` is set the market page labels the deadline "estimate may be
   - `components/vs/ChallengeRecoveryPanel.tsx` (UI)
   - `app/[locale]/vs/[id]/page.tsx` (`handleAccept` pending/uncertain paths)
 
+### 21. Screen-Reader Focus & Announcements After Challenge Result Refresh
+
+- **Behavior**:
+  - Only relevant `submitted` or `confirmed` challenge state transitions are announced in a polite live region (`role="status"`, `aria-live="polite"`, `aria-atomic="true"`). Routine background polls, idle refreshes, failed recovery states, already-confirmed initial loads, and stale fetch generations remain silent.
+  - When a refresh removes or disables the currently focused challenge action (for example `accept-stake` -> `check-status` -> `dismiss-recovery`, or `confirm-review` -> `refresh-result`), keyboard focus moves to the equivalent surviving action rather than dropping to `document.body`. Focus is never stolen if the user is focused outside the challenge controls.
+- **Interface**:
+  - `lib/challenge-refresh-focus.ts` (`deriveChallengeResultState`, `buildChallengeRefreshAnnouncement`, `resolveSurvivingChallengeAction`, `applyChallengeRefreshFocusTransition`, `restoreFocusToChallengeAction`)
+  - `hooks/useVsDetail.ts` (`challengeResultState`, `challengeRefreshAnnouncement`, `resolveFocusAfterRefresh`)
+  - `components/vs/CreateChallengeTicket.tsx` (optional `challengeResultState`, `resultTxHash`, `onRefreshResult` props; `data-testid="challenge-result-live-region"` and `data-challenge-action` markers)
+
 ---
 
 ## Contract Error Code Reference

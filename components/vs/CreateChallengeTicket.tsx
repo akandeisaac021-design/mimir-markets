@@ -3,8 +3,15 @@
 import { Activity } from "lucide-react";
 import { createHash } from "crypto";
 import { useLocale, useTranslations } from "next-intl";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { formatDeadline } from "@/lib/constants";
+import {
+  buildChallengeRefreshAnnouncement,
+  resolveSurvivingChallengeAction,
+  restoreFocusToChallengeAction,
+  type ChallengeActionId,
+  type ChallengeResultState,
+} from "@/lib/challenge-refresh-focus";
 import { evaluateMarketExpiry } from "@/lib/market-expiry";
 import {
   CREATE_TICKET_BODY_CLASS,
@@ -101,6 +108,16 @@ export type CreateChallengeTicketProps = {
    *  The ticket shows a review banner and hides the SIGNED watermark; the
    *  parent is responsible for gating submission until re-authorization. */
   accountChanged?: boolean;
+  /** Challenge result state relevant to screen-reader announcements.
+   *  Only `"submitted"` and `"confirmed"` states are announced; `"idle"`
+   *  (default) stays silent across routine refreshes. */
+  challengeResultState?: ChallengeResultState;
+  /** Optional transaction hash or revision subject for deduplicating
+   *  submitted/confirmed announcements across refreshes. */
+  resultTxHash?: string | null;
+  /** Optional surviving refresh action rendered once a challenge is submitted
+   *  or confirmed so keyboard focus transfers cleanly from the review button. */
+  onRefreshResult?: () => void;
 };
 
 /**
@@ -119,6 +136,9 @@ export default function CreateChallengeTicket({
   maxAmount,
   searchParams,
   accountChanged = false,
+  challengeResultState = "idle",
+  resultTxHash = null,
+  onRefreshResult,
 }: CreateChallengeTicketProps) {
   const t = useTranslations("create");
   const locale = useLocale();
@@ -206,8 +226,74 @@ export default function CreateChallengeTicket({
   const authDisplay = formatWalletForTicket(walletAddress);
   const showQuoted = body.length > 0;
 
+  // Screen-reader announcement: only "submitted" or "confirmed" states emit text.
+  const resultAnnouncement = useMemo(
+    () =>
+      buildChallengeRefreshAnnouncement({
+        state: challengeResultState,
+        dedupeSubject: resultTxHash ?? draftId,
+        stakeAmount: Number.isFinite(effectiveStake) ? effectiveStake : null,
+        lastAnnouncedKey: null,
+      }).announcement,
+    [challengeResultState, resultTxHash, draftId, effectiveStake],
+  );
+
+  // Keyboard focus preservation across challenge result refreshes.
+  const ticketContainerRef = useRef<HTMLDivElement | null>(null);
+  const lastFocusedActionRef = useRef<ChallengeActionId | null>(null);
+  const showRefreshAction =
+    challengeResultState !== "idle" && typeof onRefreshResult === "function";
+  const showConfirmReviewAction = !showRefreshAction;
+
+  useEffect(() => {
+    if (!lastFocusedActionRef.current) {
+      return;
+    }
+    const survivingActions: ChallengeActionId[] = [];
+    if (showConfirmReviewAction) {
+      survivingActions.push("confirm-review");
+    }
+    if (showRefreshAction) {
+      survivingActions.push("refresh-result");
+    }
+    const target = resolveSurvivingChallengeAction(
+      lastFocusedActionRef.current,
+      survivingActions,
+    );
+    if (target) {
+      restoreFocusToChallengeAction(ticketContainerRef.current, target);
+      lastFocusedActionRef.current = target;
+    } else {
+      lastFocusedActionRef.current = null;
+    }
+  }, [challengeResultState, showConfirmReviewAction, showRefreshAction]);
+
   return (
-    <div className={CREATE_TICKET_SHELL_CLASS}>
+    <div
+      ref={ticketContainerRef}
+      className={CREATE_TICKET_SHELL_CLASS}
+      onBlur={(event) => {
+        if (
+          ticketContainerRef.current &&
+          !ticketContainerRef.current.contains(event.relatedTarget as Node | null)
+        ) {
+          lastFocusedActionRef.current = null;
+        }
+      }}
+    >
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="challenge-result-live-region"
+        className={
+          resultAnnouncement
+            ? "border-b border-pv-emerald/30 bg-pv-emerald/10 px-4 py-2 text-xs text-pv-text"
+            : "sr-only"
+        }
+      >
+        {resultAnnouncement ? resultAnnouncement.message : ""}
+      </div>
       {accountChanged ? (
         <div
           role="status"
@@ -352,13 +438,32 @@ export default function CreateChallengeTicket({
               Claim: {body || "—"}
             </p>
             <p className="font-mono text-xs text-pv-text">Network: Stellar</p>
-            <button
-              type="button"
-              onClick={() => setReviewedRevision(reviewRevision)}
-              className="font-mono text-[10px] uppercase tracking-[0.12em] text-pv-emerald"
-            >
-              Confirm review
-            </button>
+            {showConfirmReviewAction ? (
+              <button
+                type="button"
+                data-challenge-action="confirm-review"
+                onFocus={() => {
+                  lastFocusedActionRef.current = "confirm-review";
+                }}
+                onClick={() => setReviewedRevision(reviewRevision)}
+                className="font-mono text-[10px] uppercase tracking-[0.12em] text-pv-emerald"
+              >
+                Confirm review
+              </button>
+            ) : null}
+            {showRefreshAction ? (
+              <button
+                type="button"
+                data-challenge-action="refresh-result"
+                onFocus={() => {
+                  lastFocusedActionRef.current = "refresh-result";
+                }}
+                onClick={onRefreshResult}
+                className="font-mono text-[10px] uppercase tracking-[0.12em] text-pv-emerald"
+              >
+                Refresh result
+              </button>
+            ) : null}
             {reviewedRevision !== null && !reviewValid ? (
               <p className="text-[10px] text-pv-muted">
                 Review invalidated: account, amount or claim changed.
