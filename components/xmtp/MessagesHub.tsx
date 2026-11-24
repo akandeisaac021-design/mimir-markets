@@ -27,11 +27,20 @@ import {
   messagesHubVisibleThreads,
   resolveMessagesHubPrivateContext,
 } from "@/lib/xmtp/messages-hub-state";
+import {
+  confirmConversationBinding,
+  parseConversationNavigationHint,
+  resolveConversationBinding,
+  resolveConversationNavigationHint,
+  type ConfirmedConversationBinding,
+  type ConversationHintFailure,
+} from "@/lib/xmtp/conversation-binding";
 import PageTransition, { AnimatedItem } from "@/components/PageTransition";
 import { Button, GlassCard } from "@/components/ui";
 import MessagesWalletGate from "@/components/xmtp/MessagesWalletGate";
 import MessagesPageHero from "@/components/xmtp/MessagesPageHero";
 import VsXmtpPanel from "@/components/xmtp/VsXmtpPanel";
+import ConversationBindingReview from "@/components/xmtp/ConversationBindingReview";
 import {
   ChevronRight,
   Radio,
@@ -199,6 +208,61 @@ export default function MessagesHub() {
     () => threads.find((d) => d.id === selectedVsId) ?? null,
     [threads, selectedVsId]
   );
+
+  // What the user confirmed in the market-context review. A private
+  // conversation opens only while this still matches the trusted rows loaded
+  // for the connected account (see lib/xmtp/conversation-binding.ts).
+  const [confirmedBinding, setConfirmedBinding] =
+    useState<ConfirmedConversationBinding | null>(null);
+  // `?vs=<id>&peer=<address>` is an untrusted preselection hint. It is checked
+  // against trusted context once the account's rows are loaded and can only
+  // select a thread for review — never open it.
+  const [navHintBlocked, setNavHintBlocked] =
+    useState<ConversationHintFailure | null>(null);
+  const navHintHandledFor = useRef<string | null>(null);
+  const trustedContext = useMemo(
+    () => ({ address: duelsAccount, items: duels }),
+    [duelsAccount, duels],
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!address || loading || duelsAccount !== address) return;
+    if (navHintHandledFor.current === address) return;
+    navHintHandledFor.current = address;
+    const hint = parseConversationNavigationHint(window.location.search);
+    if (!hint) {
+      setNavHintBlocked(null);
+      return;
+    }
+    const result = resolveConversationNavigationHint({
+      hint,
+      trusted: trustedContext,
+      address,
+    });
+    if (result.ok) {
+      setNavHintBlocked(null);
+      setSelectedVsId(result.review.vsId);
+      setSelectedForAccount(address);
+      setConfirmedBinding(null);
+    } else {
+      setNavHintBlocked(result.reason);
+    }
+  }, [address, loading, duelsAccount, trustedContext]);
+
+  const selectedEligible =
+    selectedVs != null &&
+    !isSampleVsIdForXmtp(selectedVs.id) &&
+    canOpenVsXmtpChat(selectedVs);
+  const bindingState =
+    selectedVsId != null && selectedEligible
+      ? resolveConversationBinding({
+          confirmed: confirmedBinding,
+          selectedVsId,
+          trusted: trustedContext,
+          address,
+        })
+      : null;
 
   const privateContextState = resolveMessagesHubPrivateContext({
     address,
@@ -543,8 +607,12 @@ export default function MessagesHub() {
                                       id: vs.id,
                                     })}
                                     onClick={() => {
+                                      if (selectedVsId !== vs.id) {
+                                        setConfirmedBinding(null);
+                                      }
                                       setSelectedVsId(vs.id);
                                       setSelectedForAccount(address);
+                                      setNavHintBlocked(null);
                                       markRead(vs.id);
                                     }}
                                     className={`focus-ring w-full px-5 pb-4 pt-5 text-left outline-none transition-colors sm:px-6 ${
@@ -750,7 +818,51 @@ export default function MessagesHub() {
                       </p>
                     </div>
                   ) : null}
-                  {selectedVs && privateContextState.visible ? (
+                  {navHintBlocked ? (
+                    <div
+                      role="alert"
+                      data-testid="conversation-hint-blocked"
+                      className="border-b border-amber-400/25 bg-amber-400/[0.06] px-5 py-3 sm:px-6"
+                    >
+                      <p className="text-xs leading-relaxed text-pv-text">
+                        {t(`bindingHintBlocked.${navHintBlocked}`)}
+                      </p>
+                    </div>
+                  ) : null}
+                  {selectedVs &&
+                  privateContextState.visible &&
+                  bindingState &&
+                  !bindingState.open &&
+                  bindingState.review ? (
+                    <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+                      <ConversationBindingReview
+                        review={bindingState.review}
+                        staleReason={
+                          bindingState.reason === "context_changed" ||
+                          bindingState.reason === "account_changed" ||
+                          bindingState.reason === "selection_changed"
+                            ? bindingState.reason
+                            : null
+                        }
+                        onConfirm={() => {
+                          if (bindingState.review) {
+                            setConfirmedBinding(
+                              confirmConversationBinding(
+                                bindingState.review,
+                                Date.now(),
+                              ),
+                            );
+                          }
+                        }}
+                        onCancel={() => {
+                          setConfirmedBinding(null);
+                          setSelectedVsId(null);
+                        }}
+                      />
+                    </div>
+                  ) : selectedVs &&
+                    privateContextState.visible &&
+                    (bindingState == null || bindingState.open) ? (
                     <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 md:p-5">
                       <VsXmtpPanel vs={selectedVs} embedded />
                     </div>

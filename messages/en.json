@@ -1300,6 +1300,28 @@
     "hubPanelBody": "Tap a channel row to load its encrypted chat here. Use View to open the full VS page.",
     "hubPanelMeta": "XMTP · not stored on Mimir servers",
     "hubSelectThreadAria": "Show encrypted chat for VS {id} in the panel",
+    "bindingReviewTitle": "Review before starting this private chat",
+    "bindingReviewLead": "Confirm the market and the person this encrypted conversation is bound to. Nothing opens until you confirm.",
+    "bindingMarketLabel": "Market",
+    "bindingYouLabel": "You (connected account)",
+    "bindingPeerLabel": "Counterpart",
+    "bindingSourceNote": "Shown from the duel loaded for your connected account, not from the link you followed.",
+    "bindingConfirm": "Start private chat",
+    "bindingCancel": "Cancel",
+    "bindingStale": {
+      "context_changed": "This duel changed since you reviewed it. Check the details again before continuing.",
+      "account_changed": "Your connected account changed since you reviewed this chat. Review it again for this account.",
+      "selection_changed": "You selected a different duel. Review this one before starting the chat."
+    },
+    "bindingHintBlocked": {
+      "malformed_hint": "This link’s conversation details could not be read, so nothing was opened. Pick a channel below.",
+      "no_account": "Connect your wallet to review this conversation.",
+      "context_not_loaded": "Your duels are still loading, so this link was not opened.",
+      "market_not_found": "The market in this link is not one of your duels, so nothing was opened.",
+      "not_eligible": "The market in this link has no private chat available, so nothing was opened.",
+      "not_participant": "Your connected account is not part of the market in this link, so nothing was opened.",
+      "peer_mismatch": "The counterpart in this link does not match this market’s on-chain participant, so nothing was opened."
+    },
     "withPeer": "Rival {address}",
     "badgeLive": "Live channel",
     "badgeAwaiting": "Awaiting event",
