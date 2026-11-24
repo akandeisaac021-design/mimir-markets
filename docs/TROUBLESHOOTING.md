@@ -118,10 +118,10 @@ This guide collects causes, code references, and fixes for errors contributors, 
   3. An out-of-band transaction was submitted from another client (e.g. manual CLI or wallet extension), causing local sequence state to drift.
 - **Fix**:
   1. Avoid sharing the same secret seed across multiple concurrent processes or agent workers.
-  2. In application code, use `SequenceManager` (`lib/agents/sequence-manager.ts`), which handles sequential reservation and automatically resyncs via `resync(address)` upon encountering `tx_bad_seq`.
-  3. If an autonomous worker process logs `tx_bad_seq`, restart the worker so it performs a fresh sequence read from Horizon.
+  2. In application code, use `SequenceManager` (`lib/agents/sequence-manager.ts`), which binds reservations to the selected Stellar network (`NEXT_PUBLIC_STELLAR_NETWORK` / `STELLAR_NETWORK` and optional network passphrase), rejects reuse after a network configuration change (`SequenceNetworkMismatchError`), preserves independent streams per account, and resyncs via `resync(address)` upon encountering `tx_bad_seq`.
+  3. If an autonomous worker process logs `tx_bad_seq` or `SequenceNetworkMismatchError`, restart the worker (or instantiate a new `SequenceManager` for the updated network) so it performs a fresh sequence read from Horizon.
 - **Code Location**:
-  - `lib/agents/sequence-manager.ts:6-29, 187` (`SequenceManager.resync`)
+  - `lib/agents/sequence-manager.ts` (`SequenceManager`, `SequenceNetworkMismatchError`, `SequenceManager.resync`)
   - `lib/settlement-retry.ts:235-243` (`classifySettlementError`)
 
 ---

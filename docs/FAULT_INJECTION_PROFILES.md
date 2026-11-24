@@ -112,6 +112,7 @@ For autonomous trader staking, `tests/node/trader-outage-fixtures.ts` provides a
 - **Horizon/RPC outages**: verifies provider read failures release in-flight exposure without corrupting sequence state.
 - **Stale sequences (`tx_bad_seq`)**: verifies out-of-band ledger advances trigger `resync()` and retry cleanly within authorized limits.
 - **Late submission results**: verifies delayed settlements hold in-flight exposure until settled, preventing concurrent over-allocation, and handle out-of-order sequence holes and incident `pause()`/`resume()` cleanly.
+- **Network configuration changes**: `SequenceManager` binds sequence reservations to the selected Stellar network (and optional passphrase), rejecting reservation reuse after network drift (`SequenceNetworkMismatchError`) while keeping reservations for different accounts independent (verified in `tests/node/agent-sequence-manager.test.ts`).
 
 Run the focused suite with:
 
