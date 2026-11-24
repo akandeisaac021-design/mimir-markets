@@ -15,6 +15,10 @@ import {
   type ResearchCitationView,
 } from "../../lib/research/citations";
 import type { ContextSource, MarketContextPack } from "../../lib/research/context-pack";
+import {
+  CITATION_NOW_MS,
+  CITATION_ORDERING_SOURCES,
+} from "../fixtures/research/citation-failures";
 
 const PRIMARY_HASH = "aa".repeat(32);
 const CORROB_HASH = "bb".repeat(32);
@@ -123,6 +127,74 @@ test("negative: empty sources yield empty status", () => {
   const view = buildResearchCitations({ sources: [] });
   assert.equal(view.status, "empty");
   assert.equal(researchCitationsShowsRows(view), false);
+});
+
+/* ── #936: canonical ordering ─────────────────────────────────────────────── */
+
+/** Identity order the fixtures must produce regardless of arrival order. */
+const EXPECTED_IDENTITY_ORDER = [
+  "aa".repeat(32),
+  "bb".repeat(32),
+  "cc".repeat(32),
+  "dd".repeat(32),
+];
+
+test("positive: newest capture first, then canonical identity — arrival order is irrelevant", () => {
+  const forward = buildResearchCitations({
+    sources: [...CITATION_ORDERING_SOURCES],
+    nowMs: CITATION_NOW_MS,
+  });
+  // Same sources delivered by an async response that settled in reverse.
+  const reversed = buildResearchCitations({
+    sources: [...CITATION_ORDERING_SOURCES].reverse(),
+    nowMs: CITATION_NOW_MS,
+  });
+
+  const hashes = (view: typeof forward) =>
+    view.displayable.map((row) => row.contentHash);
+
+  assert.deepEqual(hashes(forward), EXPECTED_IDENTITY_ORDER);
+  assert.deepEqual(hashes(reversed), EXPECTED_IDENTITY_ORDER);
+  assert.deepEqual(
+    forward.displayable.map((row) => row.url),
+    reversed.displayable.map((row) => row.url),
+  );
+  // Primary content hash is the newest capture; the undated row is last.
+  assert.equal(forward.displayable[0].capturedAt, CITATION_NOW_MS - 1_000);
+  assert.equal(forward.displayable[3].capturedAt, null);
+});
+
+test("boundary: equal capture times fall back to the normalized URL when there is no digest", () => {
+  const sources = [
+    source({
+      url: "https://z.example/report",
+      domain: "z.example",
+      trustTier: "corroborating",
+      contentHash: "",
+      capturedAt: NOW,
+    }),
+    source({
+      url: "https://a.example/report",
+      domain: "a.example",
+      trustTier: "corroborating",
+      contentHash: "",
+      capturedAt: NOW,
+    }),
+  ];
+
+  const one = buildResearchCitations({ sources, nowMs: NOW });
+  const two = buildResearchCitations({ sources: [...sources].reverse(), nowMs: NOW });
+
+  assert.deepEqual(
+    one.displayable.map((row) => row.url),
+    ["https://a.example/report", "https://z.example/report"],
+  );
+  assert.deepEqual(
+    two.displayable.map((row) => row.url),
+    one.displayable.map((row) => row.url),
+  );
+  // Neither source wins the duplicate collapse: no digest, different URLs.
+  assert.equal(one.duplicatedDropped, 0);
 });
 
 test("negative: javascript URL is invalid and not displayable", () => {

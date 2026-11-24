@@ -22,7 +22,11 @@ import {
 } from "@/lib/xmtp/read-state";
 import { getVSTotalPot } from "@/lib/contract";
 import { useXmtp } from "@/lib/xmtp/XmtpProvider";
-import { getMessagesHubConnectionState } from "@/lib/xmtp/messages-hub-state";
+import {
+  getMessagesHubConnectionState,
+  messagesHubVisibleThreads,
+  resolveMessagesHubPrivateContext,
+} from "@/lib/xmtp/messages-hub-state";
 import PageTransition, { AnimatedItem } from "@/components/PageTransition";
 import { Button, GlassCard } from "@/components/ui";
 import MessagesWalletGate from "@/components/xmtp/MessagesWalletGate";
@@ -93,6 +97,10 @@ export default function MessagesHub() {
   });
 
   const [duels, setDuels] = useState<VSData[]>([]);
+  // Account the rows in `duels` were fetched for. Kept separate from `address`
+  // so a wallet switch cannot render the previous account's threads while the
+  // next fetch is in flight.
+  const [duelsAccount, setDuelsAccount] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
 
@@ -101,6 +109,7 @@ export default function MessagesHub() {
     async function load() {
       if (!address) {
         setDuels([]);
+        setDuelsAccount(null);
         setLoading(false);
         return;
       }
@@ -111,12 +120,14 @@ export default function MessagesHub() {
         if (!cancelled) {
           const results = (snapshot.items ?? []).sort((a, b) => b.id - a.id);
           setDuels(results);
+          setDuelsAccount(address);
         }
       } catch (e) {
         console.error("[MessagesHub]", e);
         if (!cancelled) {
           setLoadError(true);
           setDuels([]);
+          setDuelsAccount(address);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -128,10 +139,23 @@ export default function MessagesHub() {
     };
   }, [address]);
 
+  const threads = useMemo(
+    () =>
+      messagesHubVisibleThreads(
+        { address: duelsAccount, items: duels },
+        address,
+      ),
+    [duels, duelsAccount, address],
+  );
+
+  // A wallet switch has no rows for the new account yet, so treat that window
+  // as loading instead of flashing the "no participation" empty state.
+  const isLoading = loading || (Boolean(address) && duelsAccount !== address);
+
   const { eligible, other } = useMemo(() => {
     const el: VSData[] = [];
     const rest: VSData[] = [];
-    for (const vs of duels) {
+    for (const vs of threads) {
       if (!isSampleVsIdForXmtp(vs.id) && canOpenVsXmtpChat(vs)) {
         el.push(vs);
       } else {
@@ -139,7 +163,7 @@ export default function MessagesHub() {
       }
     }
     return { eligible: el, other: rest };
-  }, [duels]);
+  }, [threads]);
 
   const [hubListTab, setHubListTab] = useState<"active" | "pending">("active");
 
@@ -152,6 +176,11 @@ export default function MessagesHub() {
   }, [eligible.length, other.length]);
 
   const [selectedVsId, setSelectedVsId] = useState<number | null>(null);
+  // Account whose private thread content is currently selected. The panel only
+  // renders while it still belongs to the connected account.
+  const [selectedForAccount, setSelectedForAccount] = useState<string | null>(
+    null,
+  );
   const hubChatPanelRef = useRef<HTMLDivElement>(null);
 
   const [readTick, setReadTick] = useState(0);
@@ -167,16 +196,24 @@ export default function MessagesHub() {
   }, []);
 
   const selectedVs = useMemo(
-    () => duels.find((d) => d.id === selectedVsId) ?? null,
-    [duels, selectedVsId]
+    () => threads.find((d) => d.id === selectedVsId) ?? null,
+    [threads, selectedVsId]
   );
+
+  const privateContextState = resolveMessagesHubPrivateContext({
+    address,
+    context: selectedForAccount
+      ? { viewerAddress: selectedForAccount, expiresAt: null }
+      : null,
+    nowMs: Date.now(),
+  });
 
   useEffect(() => {
     if (selectedVsId == null) return;
-    if (!duels.some((d) => d.id === selectedVsId)) {
+    if (!threads.some((d) => d.id === selectedVsId)) {
       setSelectedVsId(null);
     }
-  }, [duels, selectedVsId]);
+  }, [threads, selectedVsId]);
 
   useEffect(() => {
     if (selectedVsId == null) return;
@@ -194,7 +231,7 @@ export default function MessagesHub() {
     });
   }, [selectedVsId]);
 
-  const participating = duels.length > 0;
+  const participating = threads.length > 0;
   const showHubSplit =
     participating && !loadError && (eligible.length > 0 || other.length > 0);
   const showActiveInColumn =
@@ -310,11 +347,11 @@ export default function MessagesHub() {
         </div>
 
         <div className={showHubSplit ? "mt-6 sm:mt-8" : CONTENT_DIVIDER}>
-          {loading && (
+          {isLoading && (
             <ChannelListSkeleton ariaLabel={t("loadingAria")} />
           )}
 
-          {!loading && loadError && (
+          {!isLoading && loadError && (
             <AnimatedItem>
               <GlassCard className="border border-pv-danger/25 bg-pv-danger/[0.05]">
                 <div className="flex gap-3 sm:gap-4">
@@ -343,6 +380,7 @@ export default function MessagesHub() {
                           .then((snapshot) => {
                             const r = (snapshot.items ?? []).sort((a, b) => b.id - a.id);
                             setDuels(r);
+                            setDuelsAccount(address);
                           })
                           .catch(() => setLoadError(true))
                           .finally(() => setLoading(false));
@@ -356,7 +394,7 @@ export default function MessagesHub() {
             </AnimatedItem>
           )}
 
-          {!loading && !loadError && !participating && (
+          {!isLoading && !loadError && !participating && (
             <AnimatedItem>
               <GlassCard className="relative overflow-hidden border border-pv-ink/[0.1]">
                 <div className="pointer-events-none absolute -right-8 -top-8 h-32 w-32 rounded-full bg-pv-emerald/[0.06] blur-2xl" />
@@ -400,7 +438,7 @@ export default function MessagesHub() {
             </AnimatedItem>
           )}
 
-          {!loading && !loadError && showHubSplit && (
+          {!isLoading && !loadError && showHubSplit && (
             <AnimatedItem>
               <div className={HUB_SPLIT_SHELL}>
                 <div className="flex w-full flex-col border-b border-pv-border/30 md:max-h-[min(72vh,680px)] md:w-[400px] md:shrink-0 md:border-b-0 md:border-r md:border-pv-border/30">
@@ -506,6 +544,7 @@ export default function MessagesHub() {
                                     })}
                                     onClick={() => {
                                       setSelectedVsId(vs.id);
+                                      setSelectedForAccount(address);
                                       markRead(vs.id);
                                     }}
                                     className={`focus-ring w-full px-5 pb-4 pt-5 text-left outline-none transition-colors sm:px-6 ${
@@ -711,7 +750,7 @@ export default function MessagesHub() {
                       </p>
                     </div>
                   ) : null}
-                  {selectedVs ? (
+                  {selectedVs && privateContextState.visible ? (
                     <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 md:p-5">
                       <VsXmtpPanel vs={selectedVs} embedded />
                     </div>
