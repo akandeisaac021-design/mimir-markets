@@ -4,6 +4,7 @@
  *   npm run verify:release-readiness                          # self-check + offline gates
  *   npm run verify:release-readiness -- --list                # print the checklist
  *   npm run verify:release-readiness -- --evidence ev.json    # evaluate recorded evidence
+ *   npm run verify:release-readiness -- --manifest man.json   # evaluate a revision-bound manifest
  *   npm run verify:release-readiness -- --mode=release        # funded-release gate
  *   npm run verify:release-readiness -- --json --out record.json
  *
@@ -18,6 +19,7 @@
  *   1  a check failed, the checklist is incoherent, or (in release mode) a
  *      gate has no evidence
  */
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,11 +32,17 @@ import {
   formatReleaseReadinessReport,
   parseReleaseEvidence,
   serializeReleaseRecord,
+  validateReleaseGateScriptContract,
   validateReleaseReadinessRegistry,
   type ReleaseGateEvidence,
   type ReleaseGateId,
   type ReleaseMode,
 } from "../lib/ops/release-readiness";
+import {
+  evaluateReleaseEvidenceManifest,
+  isReleaseEvidenceManifest,
+  type ReleaseEvidenceManifestReport,
+} from "../lib/ops/release-evidence-manifest";
 import {
   formatProvenanceReport,
   verifyRepoArtifactProvenance,
@@ -58,9 +66,26 @@ const REPO_ROOT = path.resolve(
 );
 const READINESS_DOC = path.join(REPO_ROOT, "docs", "RELEASE_READINESS.md");
 
+function currentRevision(): string | null {
+  try {
+    const revision = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    }).trim();
+    return /^[0-9a-f]{7,64}$/i.test(revision) ? revision : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 interface Args {
   list: boolean;
   evidence?: string;
+  manifest?: string;
   mode: ReleaseMode;
   json: boolean;
   out?: string;
@@ -71,12 +96,17 @@ interface Args {
 function parseArgs(argv: string[]): Args {
   const args = new Set(argv);
   const evidenceIndex = argv.findIndex((value) => value === "--evidence");
+  const manifestIndex = argv.findIndex((value) => value === "--manifest");
   const outIndex = argv.findIndex((value) => value === "--out");
   return {
     list: args.has("--list"),
     evidence:
       evidenceIndex >= 0 && argv[evidenceIndex + 1]
         ? argv[evidenceIndex + 1]
+        : undefined,
+    manifest:
+      manifestIndex >= 0 && argv[manifestIndex + 1]
+        ? argv[manifestIndex + 1]
         : undefined,
     mode:
       args.has("--mode=release") || args.has("--release")
@@ -128,21 +158,12 @@ function selfCheck(): SelfCheck {
 
   problems.push(...validateReleaseReadinessRegistry());
 
-  // Every declared npm script must exist, or the doc tells a maintainer to run
-  // a command that no longer does anything.
   const pkg = JSON.parse(
     readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
   ) as {
     scripts?: Record<string, string>;
   };
-  const scripts = pkg.scripts ?? {};
-  for (const gate of RELEASE_GATES) {
-    if (gate.npmScript && !(gate.npmScript in scripts)) {
-      problems.push(
-        `package.json has no script "${gate.npmScript}" required by "${gate.id}"`,
-      );
-    }
-  }
+  problems.push(...validateReleaseGateScriptContract({ scripts: pkg.scripts ?? {} }));
 
   // Every path a clean checkout needs must be tracked in the repo.
   for (const gate of RELEASE_GATES) {
@@ -241,6 +262,7 @@ async function main(): Promise<void> {
         "",
         "  --list                 print every gate with its failure, rollback and artifact notes",
         "  --evidence <file>      evaluate a recorded evidence JSON file",
+        "  --manifest <file>      evaluate a revision-bound evidence manifest",
         "  --mode=release         funded-release mode: unevidenced gates are errors",
         "  --json                 print the report as JSON instead of text",
         "  --out <file>           write a deterministic release record",
@@ -257,18 +279,21 @@ async function main(): Promise<void> {
 
   const { problems, notes } = selfCheck();
 
-  // Evidence recorded by a maintainer for the live-evidence gates.
-  let recorded: Record<string, ReleaseGateEvidence> = {};
-  if (args.evidence) {
-    const evidencePath = path.resolve(process.cwd(), args.evidence);
+  if (args.manifest && args.evidence) {
+    console.error("✗ use either --manifest or --evidence, not both");
+    process.exit(1);
+  }
+
+  const evidenceSource = args.manifest ?? args.evidence;
+  let rawEvidence: unknown;
+  if (evidenceSource) {
+    const evidencePath = path.resolve(process.cwd(), evidenceSource);
     if (!existsSync(evidencePath)) {
-      console.error(`✗ evidence file not found: ${args.evidence}`);
+      console.error(`✗ evidence file not found: ${evidenceSource}`);
       process.exit(1);
     }
     try {
-      recorded = parseReleaseEvidence(
-        JSON.parse(readFileSync(evidencePath, "utf8")),
-      ).results;
+      rawEvidence = JSON.parse(readFileSync(evidencePath, "utf8")) as unknown;
     } catch (error) {
       console.error(
         `✗ release evidence refused: ${error instanceof Error ? error.message : String(error)}`,
@@ -277,8 +302,32 @@ async function main(): Promise<void> {
     }
   }
 
-  // Offline gates are verified here, now — a stale evidence file can never
-  // override a check the tool just ran itself.
+  const manifestDetected =
+    rawEvidence !== undefined && isReleaseEvidenceManifest(rawEvidence);
+  if (args.manifest && rawEvidence !== undefined && !manifestDetected) {
+    console.error("✗ --manifest requires a mimir-release-evidence-manifest document");
+    process.exit(1);
+  }
+  const expectedRevision = manifestDetected ? currentRevision() : null;
+  if (manifestDetected && !expectedRevision) {
+    console.error(
+      "✗ cannot evaluate a release evidence manifest without a resolvable HEAD revision",
+    );
+    process.exit(1);
+  }
+
+  const recorded: Record<string, ReleaseGateEvidence> = {};
+  if (rawEvidence !== undefined && !manifestDetected) {
+    try {
+      Object.assign(recorded, parseReleaseEvidence(rawEvidence).results);
+    } catch (error) {
+      console.error(
+        `✗ release evidence refused: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    }
+  }
+
   const offline: Record<string, ReleaseGateEvidence> = {
     "release-readiness-checklist": {
       status: problems.length === 0 ? "pass" : "fail",
@@ -301,15 +350,67 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  let manifestReport: ReleaseEvidenceManifestReport | null = null;
+  if (manifestDetected && expectedRevision && isRecord(rawEvidence)) {
+    const rawResults = isRecord(rawEvidence.results) ? rawEvidence.results : {};
+    const results: Record<string, unknown> = {};
+    for (const [gateId, result] of Object.entries(rawResults)) {
+      const offlineResult = offline[gateId];
+      if (!offlineResult || !isRecord(result)) {
+        results[gateId] = result;
+        continue;
+      }
+      const recordedFailed = result.status === "fail";
+      const failed = recordedFailed || offlineResult.status === "fail";
+      results[gateId] = {
+        ...result,
+        status: failed ? "fail" : "pass",
+        detail:
+          recordedFailed && typeof result.detail === "string"
+            ? result.detail
+            : offlineResult.detail,
+      };
+    }
+    manifestReport = evaluateReleaseEvidenceManifest(
+      { ...rawEvidence, results },
+      {
+        repoRoot: REPO_ROOT,
+        mode: args.mode,
+        expectedRevision,
+      },
+    );
+    if (problems.length > 0) {
+      manifestReport = {
+        ...manifestReport,
+        ok: false,
+        releaseReady: false,
+        findings: [
+          {
+            code: "EVIDENCE_INVALID",
+            severity: "error",
+            message: `checklist self-check failed: ${problems.join("; ")}`,
+          },
+          ...manifestReport.findings,
+        ],
+      };
+    }
+  }
+
   const evidence = { ...recorded, ...offline };
-  const report = evaluateReleaseReadiness(
-    {
-      schemaVersion: 1,
-      kind: "mimir-release-readiness",
-      results: evidence,
-    },
-    { mode: args.mode },
-  );
+  const report: ReleaseEvidenceManifestReport =
+    manifestReport ?? {
+      ...evaluateReleaseReadiness(
+        {
+          schemaVersion: 1,
+          kind: "mimir-release-readiness",
+          results: evidence,
+        },
+        { mode: args.mode },
+      ),
+      revision: null,
+      artifactCount: 0,
+      schemaIdentityDigest: null,
+    };
 
   if (args.json) {
     console.log(JSON.stringify(report, null, 2));
@@ -348,6 +449,13 @@ async function main(): Promise<void> {
   if (args.out) {
     const record = buildReleaseRecord(report, {
       recordedAt: args.stamp ? new Date().toISOString() : undefined,
+      evidenceManifest: manifestReport
+        ? {
+            revision: manifestReport.revision,
+            schemaIdentityDigest: manifestReport.schemaIdentityDigest,
+            artifactCount: manifestReport.artifactCount,
+          }
+        : undefined,
     });
     const outPath = path.resolve(process.cwd(), args.out);
     mkdirSync(path.dirname(outPath), { recursive: true });

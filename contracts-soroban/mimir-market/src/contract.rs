@@ -4,14 +4,18 @@
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, String, Vec};
 
 use crate::admin;
+use crate::claim_history;
 use crate::claims;
 use crate::escrow;
+use crate::fees;
 use crate::resolve;
 use crate::storage;
 use crate::types::{
-    Challenger, ChallengerPage, Claim, ClaimFeeView, CreateParams, Error, FeePolicy,
-    MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats, Verdict,
-    WinnerSide, MAX_BATCH_SIZE,
+    Challenger, ChallengerPage, Claim, ClaimFeeView, ClaimPreflight, ContractLimits, CreateParams,
+    Error, FeePolicy, MarketConfig, PayoutQuote, PendingFeePolicy, PendingOracle, PlatformStats,
+    Verdict, WinnerSide, FEE_TIMELOCK_SECONDS, LIMITS_VERSION_V1, MAX_BATCH_SIZE, MAX_CHALLENGERS,
+    MAX_CLAIM_METADATA_BYTES, MAX_INVITE_KEY_BYTES, MAX_METADATA_BYTES, MAX_TOTAL_FEE_BPS,
+    ORACLE_TIMELOCK_SECONDS,
 };
 
 #[contract]
@@ -193,6 +197,30 @@ impl MimirMarket {
         storage::get_claim(&env, claim_id)
     }
 
+    /// Canonical statement for independent client verification.
+    ///
+    /// Returns the public question, the immutable `context_hash` as
+    /// `source_commitment`, the deadline, and a v1 SHA-256 digest over exactly
+    /// those inputs. See `util::claim_statement_digest` for the byte encoding.
+    /// The statement is stable for the life of the claim, including after
+    /// challenge, resolution, or cancellation. Unknown ids fail with
+    /// `Error::ClaimNotFound`.
+    pub fn get_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Alias of `get_claim_statement`, named for callers that export a
+    /// statement to an indexer or worker.
+    pub fn export_claim_statement(env: Env, claim_id: u64) -> Result<ClaimStatement, Error> {
+        claims::get_claim_statement(&env, claim_id)
+    }
+
+    /// Digest-only view for callers that need just the canonical v1 digest
+    /// without marshalling the full statement.
+    pub fn get_claim_statement_digest(env: Env, claim_id: u64) -> Result<BytesN<32>, Error> {
+        Ok(claims::get_claim_statement(&env, claim_id)?.digest)
+    }
+
     /// Paginated list of claim ids created by `creator`, in creation order.
     ///
     /// Returns up to `limit` ids starting at `offset` (0-based) together with
@@ -212,7 +240,7 @@ impl MimirMarket {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        Ok(storage::creator_claims_page(&env, &creator, offset, limit))
+        Ok(claims::get_creator_claims(&env, creator, offset, limit))
     }
 
     /// The claim's verdict with its explicit encoding version.
@@ -313,11 +341,21 @@ impl MimirMarket {
     ///
     /// Response layout: `(version, max_batch_size)`. `version` is bumped whenever
     /// the layout changes; existing fields keep their meaning across versions.
-    pub fn get_contract_limits(env: Env) -> Result<(u32, u32), Error> {
+    pub fn get_contract_limits(env: Env) -> Result<ContractLimits, Error> {
         if !storage::is_initialized(&env) {
             return Err(Error::NotInitialized);
         }
-        Ok((1u32, MAX_BATCH_SIZE))
+        Ok(ContractLimits {
+            version: LIMITS_VERSION_V1,
+            max_challengers: MAX_CHALLENGERS,
+            max_batch_size: MAX_BATCH_SIZE,
+            max_invite_key_bytes: MAX_INVITE_KEY_BYTES,
+            max_metadata_bytes: MAX_METADATA_BYTES,
+            max_claim_metadata_bytes: MAX_CLAIM_METADATA_BYTES,
+            max_total_fee_bps: MAX_TOTAL_FEE_BPS,
+            fee_timelock_seconds: FEE_TIMELOCK_SECONDS,
+            oracle_timelock_seconds: ORACLE_TIMELOCK_SECONDS,
+        })
     }
 
     pub fn get_claim_market_config(env: Env, claim_id: u64) -> Result<MarketConfig, Error> {
@@ -371,6 +409,39 @@ impl MimirMarket {
         resolve::quote_challenger_payout(&env, claim_id, &challenger)
     }
 
+    /// Read the current arithmetic policy without reading any claim or wallet.
+    pub fn rounding_policy_version(env: Env) -> u32 {
+        let _ = env;
+        fees::ROUNDING_POLICY_VERSION
+    }
+
+    /// Preview a payout only under the caller's explicitly required policy.
+    /// Unsupported versions are refused before reading the claim or roster.
+    pub fn quote_payout_versioned(
+        env: Env,
+        claim_id: u64,
+        challenger: Address,
+        required_version: u32,
+    ) -> Result<VersionedPayoutQuote, Error> {
+        fees::require_rounding_policy_version(required_version)?;
+        Ok(VersionedPayoutQuote {
+            rounding_policy_version: fees::ROUNDING_POLICY_VERSION,
+            quote: resolve::quote_challenger_payout(&env, claim_id, &challenger)?,
+        })
+    }
+
+    /// Pull once using the same policy as a versioned preview. This retains the
+    /// legacy payout's authorization, fee accrual, dust and frozen-token fallback.
+    pub fn claim_payout_versioned(
+        env: Env,
+        challenger: Address,
+        claim_id: u64,
+        required_version: u32,
+    ) -> Result<i128, Error> {
+        fees::require_rounding_policy_version(required_version)?;
+        resolve::claim_challenger_payout(&env, challenger, claim_id)
+    }
+
     pub fn get_platform_stats(env: Env) -> Result<PlatformStats, Error> {
         let usdc = storage::usdc(&env)?;
         Ok(PlatformStats {
@@ -384,6 +455,14 @@ impl MimirMarket {
 
     pub fn get_fee_policy(env: Env) -> Result<FeePolicy, Error> {
         storage::fee_policy(&env)
+    }
+
+    /// Bounded fee-policy compatibility query for generated clients.
+    ///
+    /// Pure read returning supported policy fields, hard caps, timelock,
+    /// USDC escrow scale, rounding semantics, and current/pending policy state.
+    pub fn get_fee_policy_compatibility(env: Env) -> Result<FeePolicyCompatibility, Error> {
+        fees::fee_policy_compatibility(&env)
     }
 
     pub fn get_pending_fee_policy(env: Env) -> Option<PendingFeePolicy> {
@@ -410,7 +489,53 @@ impl MimirMarket {
         storage::withdrawable(&env, &who)
     }
 
+    pub fn get_withdrawable_batch(
+        env: Env,
+        addrs: Vec<Address>,
+    ) -> Result<Vec<i128>, Error> {
+        storage::get_withdrawable_batch(&env, addrs)
+    }
+
+    #[cfg(test)]
+    pub fn add_withdrawable(env: Env, who: Address, amount: i128) {
+        storage::add_withdrawable(&env, &who, amount);
+    }
+
     pub fn get_accrued_fees(env: Env, who: Address) -> i128 {
         storage::accrued_fees(&env, &who)
+    }
+
+    /// Return accrued, unclaimed fees for an individual address filtered by recipient class.
+    pub fn get_accrued_class_fees(
+        env: Env,
+        who: Address,
+        recipient_class: FeeRecipientClass,
+    ) -> i128 {
+        storage::accrued_class_fees(&env, &who, recipient_class)
+    }
+
+    /// Return aggregate fee liabilities by known recipient class (Platform and AgentOwner)
+    /// alongside total collectible fees, user principal in custody, and total parked withdrawables.
+    /// Bounded O(1) query without iterating markets.
+    pub fn get_fee_liability_summary(env: Env) -> Result<FeeLiabilitySummary, Error> {
+        fees::fee_liability_summary(&env)
+    }
+
+    /// Alias for get_fee_liability_summary matching generic query naming.
+    pub fn get_fee_liabilities(env: Env) -> Result<FeeLiabilitySummary, Error> {
+        fees::fee_liability_summary(&env)
+    }
+
+    /// Return fee liability for a specific known recipient class (Platform or AgentOwner).
+    pub fn get_fee_liability_by_class(
+        env: Env,
+        recipient_class: FeeRecipientClass,
+    ) -> Result<FeeClassLiability, Error> {
+        fees::fee_liability_by_class(&env, recipient_class)
+    }
+
+    /// Current total uncollected withdrawable balances parked across all users.
+    pub fn get_total_withdrawable(env: Env) -> i128 {
+        storage::total_withdrawable(&env)
     }
 }

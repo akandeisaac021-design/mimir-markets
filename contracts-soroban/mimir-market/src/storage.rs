@@ -6,8 +6,8 @@
 use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::types::{
-    Challenger, ChallengerPage, Claim, Error, FeePolicy, PendingFeePolicy, PendingOracle,
-    RematchStatus, Verdict,
+    Challenger, ChallengerPage, Claim, Error, FeePolicy, FeeRecipientClass, PendingFeePolicy,
+    PendingOracle, RematchStatus, Verdict,
 };
 
 /// Maximum number of addresses accepted by [`get_withdrawable_batch`].
@@ -34,12 +34,26 @@ pub enum DataKey {
     Usdc,
     Policy,
     Pending,
+    /// Active fee-policy revision when the current pending policy was queued.
+    /// Kept separate from `PendingFeePolicy` so adding this guard does not
+    /// change the serialized shape of an already queued policy.
+    PendingPolicyBaseRevision,
     /// Queued oracle rotation (separate from fee-policy Pending).
     PendingOracle,
     ClaimCount,
     TotalResolved,
     FeesAccrued,
     FeesClaimed,
+    /// Cumulative platform fees accrued.
+    PlatformFeesAccrued,
+    /// Cumulative platform fees claimed.
+    PlatformFeesClaimed,
+    /// Cumulative agent owner fees accrued.
+    AgentOwnerFeesAccrued,
+    /// Cumulative agent owner fees claimed.
+    AgentOwnerFeesClaimed,
+    /// Total current withdrawable balance across all accounts.
+    TotalWithdrawable,
     Claim(u64),
     Challengers(u64),
     /// Versioned verdict written at resolution. Absent on claims resolved
@@ -50,12 +64,21 @@ pub enum DataKey {
     Withdrawable(Address),
     /// Accrued, unclaimed fees. Always pulled, never pushed.
     Accrued(Address),
+    /// Lifetime fees already withdrawn by one recipient.
+    ClaimedFees(Address),
     /// Rematch parent link validation cache: (parent_id, child_id) -> RematchStatus
     RematchParent(u64, u64),
     /// Per-creator claim index page: (creator, page_index) -> Vec<u64> of claim ids.
     CreatorClaims(Address, u32),
     /// Per-creator total claim count, used to derive the page layout.
     CreatorClaimCount(Address),
+    /// Per-claim transition history head: newest sequence number and whether
+    /// recording started at creation. See `claim_history`.
+    ClaimHistoryHead(u64),
+    /// One recorded claim transition, keyed by its stable identity
+    /// `(claim_id, seq)`. One entry per transition keeps a history read
+    /// O(page) instead of O(challengers).
+    ClaimHistoryEntry(u64, u32),
 }
 
 /// Persistent entries are bumped to roughly 30 days of ledgers on touch so an
@@ -85,6 +108,7 @@ pub fn is_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::Paused, &paused);
 }
@@ -133,6 +157,10 @@ pub fn set_fee_policy(env: &Env, policy: &FeePolicy) {
     env.storage().instance().set(&DataKey::Policy, policy);
 }
 
+pub fn fee_policy_revision(env: &Env) -> Result<u64, Error> {
+    Ok(fee_policy(env)?.revision)
+}
+
 pub fn pending_fee_policy(env: &Env) -> Option<PendingFeePolicy> {
     env.storage().instance().get(&DataKey::Pending)
 }
@@ -141,8 +169,23 @@ pub fn set_pending_fee_policy(env: &Env, pending: &PendingFeePolicy) {
     env.storage().instance().set(&DataKey::Pending, pending);
 }
 
+pub fn pending_fee_policy_base_revision(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingPolicyBaseRevision)
+}
+
+pub fn set_pending_fee_policy_base_revision(env: &Env, revision: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingPolicyBaseRevision, &revision);
+}
+
 pub fn clear_pending_fee_policy(env: &Env) {
     env.storage().instance().remove(&DataKey::Pending);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingPolicyBaseRevision);
 }
 
 pub fn pending_oracle(env: &Env) -> Option<PendingOracle> {
@@ -204,6 +247,56 @@ pub fn add_lifetime_fees_claimed(env: &Env, delta: i128) {
     env.storage().instance().set(&DataKey::FeesClaimed, &next);
 }
 
+pub fn platform_fees_accrued(env: &Env) -> i128 {
+    amount(env, DataKey::PlatformFeesAccrued)
+}
+
+pub fn add_platform_fees_accrued(env: &Env, delta: i128) {
+    let next = platform_fees_accrued(env) + delta;
+    env.storage().instance().set(&DataKey::PlatformFeesAccrued, &next);
+}
+
+pub fn platform_fees_claimed(env: &Env) -> i128 {
+    amount(env, DataKey::PlatformFeesClaimed)
+}
+
+pub fn add_platform_fees_claimed(env: &Env, delta: i128) {
+    let next = platform_fees_claimed(env) + delta;
+    env.storage().instance().set(&DataKey::PlatformFeesClaimed, &next);
+}
+
+pub fn agent_owner_fees_accrued(env: &Env) -> i128 {
+    amount(env, DataKey::AgentOwnerFeesAccrued)
+}
+
+pub fn add_agent_owner_fees_accrued(env: &Env, delta: i128) {
+    let next = agent_owner_fees_accrued(env) + delta;
+    env.storage().instance().set(&DataKey::AgentOwnerFeesAccrued, &next);
+}
+
+pub fn agent_owner_fees_claimed(env: &Env) -> i128 {
+    amount(env, DataKey::AgentOwnerFeesClaimed)
+}
+
+pub fn add_agent_owner_fees_claimed(env: &Env, delta: i128) {
+    let next = agent_owner_fees_claimed(env) + delta;
+    env.storage().instance().set(&DataKey::AgentOwnerFeesClaimed, &next);
+}
+
+pub fn total_withdrawable(env: &Env) -> i128 {
+    amount(env, DataKey::TotalWithdrawable)
+}
+
+pub fn add_total_withdrawable(env: &Env, delta: i128) {
+    let next = total_withdrawable(env) + delta;
+    env.storage().instance().set(&DataKey::TotalWithdrawable, &next);
+}
+
+pub fn sub_total_withdrawable(env: &Env, delta: i128) {
+    let next = (total_withdrawable(env) - delta).max(0);
+    env.storage().instance().set(&DataKey::TotalWithdrawable, &next);
+}
+
 // ── Claims ───────────────────────────────────────────────────────────────────
 
 pub fn get_claim(env: &Env, id: u64) -> Result<Claim, Error> {
@@ -238,6 +331,11 @@ pub fn get_claim_opt(env: &Env, id: u64) -> Option<Claim> {
         }
         None => None,
     }
+}
+
+/// Whether a claim entry exists, without deserializing it or bumping its TTL.
+pub fn has_claim(env: &Env, id: u64) -> bool {
+    env.storage().persistent().has(&DataKey::Claim(id))
 }
 
 pub fn set_claim(env: &Env, id: u64, claim: &Claim) {
@@ -405,6 +503,16 @@ pub fn get_creator_claims(
     (out, total)
 }
 
+pub fn creator_claims_page(
+    env: &Env,
+    creator: &Address,
+    offset: u32,
+    limit: u32,
+) -> (Vec<u64>, u32) {
+    let (vec, total) = get_creator_claims(env, creator, offset, limit);
+    (vec, total as u32)
+}
+
 // ── Versioned verdicts ───────────────────────────────────────────────────────
 
 /// The versioned verdict stored for a resolved claim, if one was written.
@@ -456,10 +564,15 @@ pub fn add_withdrawable(env: &Env, who: &Address, delta: i128) {
     let key = DataKey::Withdrawable(who.clone());
     let next = address_i128(env, key.clone()) + delta;
     set_address_i128(env, key, next);
+    add_total_withdrawable(env, delta);
 }
 
 pub fn clear_withdrawable(env: &Env, who: &Address) {
-    set_address_i128(env, DataKey::Withdrawable(who.clone()), 0);
+    let current = withdrawable(env, who);
+    if current > 0 {
+        set_address_i128(env, DataKey::Withdrawable(who.clone()), 0);
+        sub_total_withdrawable(env, current);
+    }
 }
 
 /// Read the withdrawable balance without any pause check.
@@ -468,6 +581,7 @@ pub fn clear_withdrawable(env: &Env, who: &Address) {
 /// payable while the market is paused. This accessor exists so callers can
 /// make that intent explicit and so a future refactor of [`withdrawable`]
 /// cannot accidentally reintroduce a pause gate on the read path.
+#[allow(dead_code)]
 pub fn withdrawable_unpaused(env: &Env, who: &Address) -> i128 {
     withdrawable(env, who)
 }
@@ -508,10 +622,24 @@ pub fn clear_accrued_fees(env: &Env, who: &Address) {
     set_address_i128(env, DataKey::Accrued(who.clone()), 0);
 }
 
+/// Lifetime fees already withdrawn by `who`, so a fee account can report
+/// `outstanding = accrued - claimed` without losing the distinction between
+/// never accrued and fully claimed.
+pub fn claimed_fees(env: &Env, who: &Address) -> i128 {
+    address_i128(env, DataKey::ClaimedFees(who.clone()))
+}
+
+pub fn add_claimed_fees(env: &Env, who: &Address, delta: i128) {
+    let key = DataKey::ClaimedFees(who.clone());
+    let next = address_i128(env, key.clone()) + delta;
+    set_address_i128(env, key, next);
+}
+
 /// Read accrued, unclaimed fees without any pause check.
 ///
 /// Fee pulls are always pull-based and MUST remain available while paused so
 /// accrued protocol/beneficiary funds are never frozen by an operator pause.
+#[allow(dead_code)]
 pub fn accrued_fees_unpaused(env: &Env, who: &Address) -> i128 {
     accrued_fees(env, who)
 }

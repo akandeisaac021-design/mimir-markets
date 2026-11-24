@@ -48,6 +48,11 @@
 
 import { createHash } from "node:crypto";
 
+import {
+  REVIEWED_SCRIPT_NAMES,
+  extractNpmScriptReferences,
+} from "./package-script-contract";
+
 export const RELEASE_READINESS_SCHEMA_VERSION = 1 as const;
 export const RELEASE_READINESS_KIND = "mimir-release-readiness" as const;
 
@@ -762,6 +767,55 @@ export function validateReleaseReadinessRegistry(): string[] {
   return problems;
 }
 
+export interface ReleaseGateScriptContractOptions {
+  gates?: readonly ReleaseGate[];
+  scripts: Readonly<Record<string, unknown>>;
+  reviewedScripts?: ReadonlySet<string> | readonly string[];
+}
+
+/**
+ * Every `npm run <name>` in a release gate must exist in `package.json` and in
+ * the reviewed package-script contract. This includes chained commands: an
+ * unconfigured gate is a release failure, never an optional step to skip.
+ */
+export function validateReleaseGateScriptContract(
+  options: ReleaseGateScriptContractOptions,
+): string[] {
+  const problems: string[] = [];
+  const gates = options.gates ?? RELEASE_GATES;
+  const reviewedScripts = options.reviewedScripts
+    ? new Set<string>(options.reviewedScripts)
+    : new Set<string>(REVIEWED_SCRIPT_NAMES);
+
+  for (const gate of gates) {
+    const referencedScripts = new Set<string>(extractNpmScriptReferences(gate.command));
+    if (typeof gate.npmScript === "string" && gate.npmScript.trim() !== "") {
+      referencedScripts.add(gate.npmScript);
+    }
+
+    for (const name of referencedScripts) {
+      if (!Object.prototype.hasOwnProperty.call(options.scripts, name)) {
+        problems.push(
+          `gate "${gate.id}" requires npm script "${name}", which is missing from package.json; missing release commands are failures, not optional gates`,
+        );
+      } else if (
+        typeof options.scripts[name] !== "string" ||
+        options.scripts[name]!.trim() === ""
+      ) {
+        problems.push(
+          `gate "${gate.id}" requires npm script "${name}", but its package.json command is empty or invalid`,
+        );
+      }
+      if (!reviewedScripts.has(name)) {
+        problems.push(
+          `gate "${gate.id}" requires npm script "${name}", which is not in the reviewed package-script contract`,
+        );
+      }
+    }
+  }
+  return problems;
+}
+
 // ── Documentation drift ──────────────────────────────────────────────────────
 
 /**
@@ -794,7 +848,7 @@ export function findDocumentationDrift(doc: string): string[] {
 
 // ── Fingerprint ──────────────────────────────────────────────────────────────
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object")
     return JSON.stringify(value) ?? "null";
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -998,6 +1052,19 @@ export type ReleaseFindingCode =
   | "EVIDENCE_INVALID"
   | "EVIDENCE_UNKNOWN_GATE"
   | "EVIDENCE_SECRET_SHAPED"
+  | "EVIDENCE_INVALID_REVISION"
+  | "EVIDENCE_MISSING_REVISION"
+  | "EVIDENCE_MIXED_REVISION"
+  | "EVIDENCE_REVISION_MISMATCH"
+  | "EVIDENCE_MISSING_RESULT"
+  | "EVIDENCE_COMMAND_MISSING"
+  | "EVIDENCE_COMMAND_MISMATCH"
+  | "EVIDENCE_SCHEMA_IDENTITY_MISMATCH"
+  | "EVIDENCE_ARTIFACT_PATH_INVALID"
+  | "EVIDENCE_ARTIFACT_MISSING"
+  | "EVIDENCE_ARTIFACT_DIGEST_INVALID"
+  | "EVIDENCE_ARTIFACT_DIGEST_MISMATCH"
+  | "EVIDENCE_ARTIFACT_DIGEST_MISSING"
   | "GATE_FAILED"
   | "GATE_MISSING_EVIDENCE"
   | "GATE_NOT_EVIDENCED";
@@ -1211,8 +1278,13 @@ function statusMark(status: EvaluatedGateStatus): string {
 export function formatReleaseReadinessReport(
   report: ReleaseReadinessReport,
 ): string {
+  const outcome = !report.ok
+    ? "FAILED"
+    : report.findings.some((finding) => finding.severity === "warning")
+      ? "WARNINGS"
+      : "OK";
   const lines: string[] = [
-    `release readiness (${report.mode}): ${report.ok ? "OK" : "FAILED"}`,
+    `release readiness (${report.mode}): ${outcome}`,
     `  fingerprint ${report.fingerprint.slice(0, 16)}…`,
     `  gates ${report.summary.passed}/${report.summary.total} passing, ` +
       `${report.summary.failed} failed, ${report.summary.missing} not evidenced ` +
@@ -1251,9 +1323,14 @@ export function formatReleaseReadinessReport(
  * findings only. No timestamps (unless the caller stamps one) and no evidence
  * text, so two runs over the same inputs are byte-identical.
  */
+export interface BuildReleaseRecordOptions {
+  recordedAt?: string;
+  evidenceManifest?: Record<string, unknown>;
+}
+
 export function buildReleaseRecord(
   report: ReleaseReadinessReport,
-  options: { recordedAt?: string } = {},
+  options: BuildReleaseRecordOptions = {},
 ): Record<string, unknown> {
   const record: Record<string, unknown> = {
     schemaVersion: RELEASE_READINESS_SCHEMA_VERSION,
@@ -1278,6 +1355,8 @@ export function buildReleaseRecord(
     })),
   };
   if (options.recordedAt) record.recordedAt = options.recordedAt;
+  if (options.evidenceManifest)
+    record.evidenceManifest = options.evidenceManifest;
   return record;
 }
 

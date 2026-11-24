@@ -1,6 +1,6 @@
 //! Value types for the squad pool. Mirrors `contracts/MimirSquad.sol`.
 
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 /// Version tag for the squad settlement manifest. Bump on any change to the
 /// manifest's encoded layout so off-chain indexers can reject unknown shapes.
@@ -29,6 +29,11 @@ pub const MAX_DURATION: u64 = 31_536_000; // 365 days
 /// Maximum number of market ids accepted by `get_markets_batch` in a single call.
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// Maximum number of entitlement records returned by `get_entitlements_page` in
+/// a single call. A page is refused rather than truncated when `limit` exceeds
+/// this, so a caller always knows the window it asked for was served whole.
+pub const MAX_ENTITLEMENT_PAGE: u32 = 50;
+
 /// Upper bound on the byte length of a market question.
 ///
 /// The question is free text supplied by the captain and carried on the
@@ -47,6 +52,13 @@ pub const USDC_DECIMALS: u32 = 7;
 
 /// A queued oracle rotation cannot take effect before this much time passes.
 pub const ORACLE_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
+
+/// Storage schema version of the squad pool contract, exposed to indexers so
+/// they can refuse to interpret storage written under an unsupported layout.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Lowest schema version an indexer built against this descriptor will accept.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
 
 /// A queued fee-recipient rotation cannot take effect before this much time passes.
 pub const FEE_RECIPIENT_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
@@ -94,20 +106,39 @@ pub struct ClaimResult {
     pub net: i128,
 }
 
+/// Protocol limits enforced by `create_market`, exposed for clients so a UI can
+/// validate a market before submitting it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SquadLimits {
+    pub max_fee_bps: u32,
+    pub min_duration: u64,
+    pub max_duration: u64,
+    pub max_question_bytes: u32,
+}
+
+/// Read-only settlement readiness for one market: whether it is already
+/// resolved, whether the oracle may resolve it now, whether pre-deadline
+/// withdrawals are still open, and the escrow still owed to winners.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementReadiness {
+    pub resolved: bool,
+    pub oracle_ready: bool,
+    pub withdrawal_open: bool,
+    pub remaining_escrow: i128,
+}
+
 /// Versioned, digest-bound settlement manifest. Binds the winning side, fee
 /// policy and pool totals so that every claim order can be checked against a
 /// single commitment, and so integer conservation (`pool_a + pool_b ==
 /// winners_payout_gross + fee_total + residual`) is verifiable exactly.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SettlementManifest {
-    pub version: u32,
-    pub result: u32,
-    pub fee_bps: u32,
-    pub pool_a: i128,
-    pub pool_b: i128,
-    pub liability_total: i128,
-    pub digest: soroban_sdk::BytesN<32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaDescriptor {
+    pub schema_version: u32,
+    pub min_supported_version: u32,
+    pub usdc_decimals: u32,
 }
 
 /// Explicit claim state for a wallet's position in a squad market.
@@ -187,4 +218,6 @@ pub enum Error {
     UnsupportedManifestVersion = 35,
     /// The settlement manifest digest does not match the bound market state.
     ManifestDigestMismatch = 36,
+    /// New market creation or deposits are blocked while the pool is paused.
+    Paused = 37,
 }

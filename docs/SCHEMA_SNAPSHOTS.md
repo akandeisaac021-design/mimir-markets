@@ -33,6 +33,11 @@ A snapshot is valid only when the machine speaks `schemaVersion: 1`, uses
 `sha256`, and carries a 64-character lowercase-hex fingerprint. Garbage JSON is
 rejected rather than treated as verified.
 
+For the reversible migration rehearsal from a synthetic read-index snapshot,
+see [`docs/MIGRATIONS.md`](./MIGRATIONS.md#migration-rehearsal-report-synthetic-snapshots)
+and `npm run verify:migration-rehearsal`. It compares canonical fingerprints
+across up → down → reapply using isolated in-memory state.
+
 ## Failure behaviour
 
 The gate fails closed. `ok` is true only when there are zero error findings:
@@ -53,6 +58,12 @@ remediation command. They never include row data, addresses, or secrets.
 ## Offline cross-workspace compatibility report
 
 `npm run report:compat` (and `npm run report:compat -- --json` for machine-readable output) compares the app, bindings, contracts, and schema versions recorded in tracked artifacts and flags incompatible combinations. It reads only committed files and never invokes live services, so it needs no credentials and performs no network calls. A combination is reported as incompatible when the schema snapshot's `schemaVersion` differs from the schema version declared by the app, or when a workspace's declared version does not match the version pinned in the shared compatibility manifest. Findings name the workspaces involved and the remediation step.
+
+## Offline artifact and schema support bundle
+
+`npm run report:support-bundle` (and `npm run report:support-bundle -- --json` or `--out <file>`) packages the offline schema snapshot fingerprint and drift report alongside contract Wasm digests and release readiness validation into a reproducible, deterministic bundle. Like the snapshot gate, it reads only public committed artifacts, never accesses `process.env` or a live database, and scrubs secret-shaped strings.
+
+The funded-release evidence manifest (`npm run verify:release-readiness -- --manifest <file>`) also pins this snapshot's `schemaVersion`, `hashAlgorithm`, `source` and `fingerprint`, together with the release readiness fingerprint, in its `schemaIdentity`. A manifest recorded before a schema snapshot change is refused with `EVIDENCE_SCHEMA_IDENTITY_MISMATCH`; regenerate it on the released revision.
 
 ## Release, rollback, artifact, and environment
 

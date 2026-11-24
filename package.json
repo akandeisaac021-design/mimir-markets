@@ -6,7 +6,10 @@
     "node": ">=22.0.0"
   },
   "scripts": {
+    "prepack": "node scripts/check-tracked-path-case.mjs",
     "oracle:scenarios": "tsx scripts/oracle-outage-scenarios.ts",
+    "oracle:compare": "tsx scripts/oracle-policy-compare.ts",
+    "oracle:policy-compare": "tsx scripts/oracle-policy-compare.ts",
     "dev": "next dev",
     "dev:clean": "rm -rf .next && next dev",
     "clean": "rm -rf .next",
@@ -22,6 +25,7 @@
     "check:lockfile": "git diff --exit-code package-lock.json",
     "check:toolchains": "tsx scripts/check-contract-toolchains.ts",
     "check:schema-snapshot": "tsx scripts/check-schema-snapshot.ts",
+    "verify:migration-rehearsal": "node --import tsx scripts/migration-rehearsal.ts",
     "check:openapi": "tsx scripts/generate-agent-openapi.ts",
     "check:api-fixtures": "node --import tsx scripts/check-api-contract-fixtures.ts",
     "check:trace": "tsx scripts/check-trace-correlation.ts",
@@ -53,8 +57,10 @@
     "verify:analytics": "tsx scripts/check-analytics-gates.ts",
     "verify:status": "tsx scripts/verify-operational-status.ts",
     "verify:package-scripts": "node --import tsx scripts/verify-package-scripts.ts",
+    "report:support-bundle": "tsx scripts/report-support-bundle.ts",
     "oracle": "tsx --env-file-if-exists=.env.local agents/oracle/index.ts",
     "oracle:challenge": "AUTO_CHALLENGE=1 tsx --env-file-if-exists=.env.local agents/oracle/index.ts",
+    "market-creator:manifest": "tsx scripts/market-creator-manifest.ts",
     "market-creator": "tsx --env-file-if-exists=.env.local agents/market-creator/index.ts",
     "council": "tsx --env-file-if-exists=.env.local agents/council/index.ts",
     "sync": "tsx --env-file-if-exists=.env.local agents/sync/index.ts",
@@ -122,6 +128,7 @@
     "autoprefixer": "^10.0.0",
     "c8": "^10.1.3",
     "postcss": "^8",
+    "semver": "^7.8.5",
     "solc": "0.8.28",
     "tailwindcss": "^3.4.0",
     "typescript": "^5"

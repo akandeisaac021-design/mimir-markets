@@ -68,6 +68,13 @@ Before opening a PR, run the TypeScript typechecker:
 npm run typecheck
 ```
 
+## Before packaging
+
+`npm pack` runs `npm run prepack` to check tracked files and directories for
+case-only collisions in the Git index. For example, tracking both `Docs/a.md`
+and `docs/b.md` reports `Case-only tracked path collision: "Docs" / "docs"`.
+Rename the conflicting paths in Git and rerun the check.
+
 ## Verified package script contract
 
 All contributor, CI, and release scripts in `package.json` are pinned against real targets on disk by [`lib/ops/package-script-contract.ts`](lib/ops/package-script-contract.ts) and verified offline by:
@@ -84,11 +91,13 @@ npm run build                # Production Next.js build
 npm run check:terms          # Forbidden-terms guardrail (alias: npm run lint)
 npm run check:toolchains     # Rust toolchain / MSRV / CI matrix parity
 npm run check:schema-snapshot # Postgres schema snapshot gate (-- --write to update)
+npm run verify:migration-rehearsal # Migration up/down rehearsal from a synthetic read-index snapshot
 npm run check:locales:strict # Locale completeness check (non-strict: npm run check:locales)
 npm run check:driver-parity  # CI path-scope parity check
 npm run check:openapi        # Agent OpenAPI contract check (-- --write to regenerate)
 npm run verify:cache-backup -- tests/fixtures/cache-backup/valid.json
-npm run verify:release-readiness
+npm run verify:release-readiness # Release checklist (-- --manifest <file> for revision-bound evidence)
+npm run report:support-bundle # Offline artifact and schema support bundle
 npm run test:node            # Full Node test suite (alias: npm run test:smoke)
 npm run test:coverage        # Money-moving module coverage thresholds via c8
 npm run smoke:browser        # Secret-free Playwright browser smoke

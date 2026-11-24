@@ -23,6 +23,7 @@ npm run verify:release-readiness -- --json       # machine-readable report
 # A funded release also records the evidence for the gates that need a live
 # deployment, then runs the checklist in release mode:
 npm run verify:release-readiness -- --evidence evidence.json --mode=release
+npm run verify:release-readiness -- --manifest evidence-manifest.json --mode=release
 npm run verify:release-readiness -- --out release-record.json
 Production installs from the committed lockfile. `vercel.json` sets
 `installCommand` to `npm ci` - the same install CI runs - so a deploy cannot
@@ -31,7 +32,7 @@ dependencies is a deliberate lockfile commit, not a side effect of deploying.
 Two modes, and the difference is the whole point:
 
 Mode	Meaning
-develop (default)	The CLI verifies what it can run itself: checklist coherence, artifact provenance, the cache-backup fixture, the saved-ledger replay and the SBOM. Anything not run in this invocation - the remaining offline gates (each of which CI runs as its own step) and everything that needs a live deployment - is reported as not evidenced (a warning), never as passing. Exit code 0 means "the reproducible part of the release is green".
+develop (default)	The CLI verifies what it can run itself: checklist coherence, artifact provenance, the cache-backup fixture, the saved-ledger replay and the SBOM. Anything not run in this invocation - the remaining offline gates (each of which CI runs as its own step) and everything that needs a live deployment - is reported as not evidenced (a warning), never as passing. The text report says WARNINGS when evidence is missing; OK is reserved for a report with no warnings or errors. Exit code 0 means the checks required by this mode passed, not that every release gate has passed.
 release	Every gate must have recorded evidence and pass. A gate with no evidence is an error, so a release cannot be declared ready by omitting the gates that need a deployment.
 CI runs the develop mode on every pull request (the verify job in
 .github/workflows/ci.yml), so a release never discovers these checks late.
@@ -86,7 +87,7 @@ artifact-provenance	A Wasm is missing, unpinned, or its sha256 differs from depl
 release-sbom	The lockfile is missing, corrupt, an unsupported lockfileVersion, or yields zero components. Generation fails closed and nothing is uploaded — an empty SBOM is never published.	Re-run npm install to refresh package-lock.json, or re-run the release-sbom workflow (--clobber) / delete the bad release asset.	sbom/mimir.cdx.json locally; mimir-<tag>.cdx.json attached to the GitHub release by .github/workflows/release-sbom.yml.
 cache-backup-verify	The committed archive fails schema, checksum or privacy verification. Fail-closed findings: BACKUP_INVALID, BACKUP_KIND_MISMATCH, BACKUP_SCHEMA_UNSUPPORTED, BACKUP_MISSING_TABLE, BACKUP_UNKNOWN_TABLE, BACKUP_EMPTY, BACKUP_CHECKSUM_MISMATCH, BACKUP_PRIVATE_CONTENT_LEAK.	Do not restore the archive. Regenerate it from a healthy database, or re-warm the read index from chain — the chain stays the source of truth and is never written by a restore.	A pass/fail verdict plus the archive checksum; no database or network access.
 ledger-fixture-replay	Replay is refused: partial capture, orphan events, conflicting ledger positions, unsafe (non-string) money values, or a fingerprint that differs from the reviewed fixture.	Roll the projection and the fixture back together, re-run the release checks, and redeploy the sync worker. Never copy fixture rows into production.	One JSON reconciliation artifact on stdout (ledger bounds, fingerprint, resume cursor, deterministic rows).
-release-readiness-checklist	A gate is structurally invalid, its npm script is missing from package.json, a declared path is absent, or docs/RELEASE_READINESS.md no longer describes every gate id and command. The checklist fails instead of drifting.	Restore the missing script, path or doc section, or update the doc in the same pull request that changes the gate. Never silence the check to ship.	The printed checklist, and — with --out — a deterministic JSON release record (no timestamps unless --stamp).
+release-readiness-checklist	A gate is structurally invalid, any referenced npm script is missing from package.json or the reviewed package-script contract, a declared path is absent, or docs/RELEASE_READINESS.md no longer describes every gate id and command. The checklist fails instead of drifting; a missing chained command is a release failure, never an optional gate.	Restore the missing script, path or doc section, or update the doc in the same pull request that changes the gate. Never silence the check to ship.	The printed checklist, and — with --out — a deterministic JSON release record (no timestamps unless --stamp).
 deployment-verification	An on-chain value (owner, oracle, USDC SAC, fee policy, WASM hash) disagrees with the configured environment, or the RPC reports an unhealthy or wrong-passphrase network. Read-only: nothing is submitted.	Stop the rollout. Redeploy from the previously pinned Wasm and restore the env, then re-run verification. A wrong fee policy or oracle address is a deployment rollback, not a runtime flag.	A verification log with the compared values; retain the contract ids, the deployed WASM hash, ledger sequences and transaction hashes.
 onchain-smoke	A create → challenge → resolve → refund / pull-payout cycle fails against the live deployment. Funded flows are blocked until the smoke passes.	Pause settlement (MIMIR_PAUSE_ORACLE_SETTLEMENT=1), redeploy the previous pinned Wasm, and re-run the smoke before resuming.	Transaction hashes and resolve / refund / pull-payout evidence; retain them with the release record.
 x402-payment-smoke	A paid endpoint refuses a valid proof, or accepts one it cannot verify off Horizon. Unverified payments are never recorded as revenue, so the failure is a refusal, not a silent sale.	Pause selling (MIMIR_PAUSE_X402_SELLING=1) — reads and settlement keep working — then restore the provider endpoint and re-run the smoke.	Payment hashes and the verification reasons observed.
@@ -189,6 +190,70 @@ offline-only.json (nothing recorded for the live gates — ready in develop
 mode, refused in release mode), failed-gate.json, unknown-gate.json,
 waived-gate.json, secret-shaped.json and empty-results.json.
 
+Revision-bound evidence manifest
+For a funded review, record a manifest so every gate result is bound to the
+same git revision. `--manifest <file>` requires this document; `--evidence`
+keeps accepting the legacy shape above and auto-detects a manifest when it sees
+the manifest `kind`.
+
+JSON
+
+{
+  "schemaVersion": 1,
+  "kind": "mimir-release-evidence-manifest",
+  "revision": "<full git SHA of the reviewed revision>",
+  "schemaIdentity": {
+    "readinessFingerprint": "<releaseReadinessFingerprint()>",
+    "schemaSnapshot": {
+      "schemaVersion": 1,
+      "hashAlgorithm": "sha256",
+      "source": "lib/db.ts",
+      "fingerprint": "<schemas/db-schema.snapshot.json fingerprint>"
+    },
+    "digest": "<sha256 of the canonical identity above>"
+  },
+  "commands": {
+    "deployment-verification": "npm run verify:deployment"
+  },
+  "artifacts": {
+    "deployment-verification": [
+      { "path": "evidence/verify-deployment.log", "sha256": "<sha256 of file bytes>" }
+    ]
+  },
+  "results": {
+    "deployment-verification": {
+      "status": "pass",
+      "revision": "<the same git SHA>",
+      "command": "npm run verify:deployment",
+      "detail": "on-chain owner, oracle, USDC SAC, fee policy and WASM hash all match"
+    }
+  }
+}
+
+Every release gate id must be present under `results`, including advisory
+gates. Every recorded result must repeat the manifest `revision` and the exact
+`command` declared by the registry (`commands` is checked too), and the
+manifest `schemaIdentity` must match the checked-out release readiness and
+schema snapshot identities. Mixed-revision results, omitted gates, a changed
+command or a stale schema identity are release-blocking findings.
+
+Artifact digests are sha256 over file bytes. Artifact `path` values are
+normalized, POSIX-style paths relative to an explicit evidence root (the
+repository root for the CLI). Absolute paths, `..` segments, duplicate or
+`.` segments, backslashes, and symlinks in any path component are refused
+before the file is read. Escaping or symlinked paths produce the deterministic
+finding `EVIDENCE_ARTIFACT_PATH_INVALID` with a reason (`parent-segment`,
+`symlink`, and so on); a missing file is `EVIDENCE_ARTIFACT_MISSING`, and a
+changed byte is `EVIDENCE_ARTIFACT_DIGEST_MISMATCH`. At least one artifact
+digest is required, and it must live under the root even when the digest
+matches an outside file.
+
+`--out` adds an `evidenceManifest` binding (revision, schema identity digest
+and artifact count) to the deterministic release record. Use
+`lib/ops/release-evidence-manifest.ts` (`buildReleaseEvidenceManifest`,
+`evaluateReleaseEvidenceManifest`, `resolveEvidenceArtifactPath`) to produce
+and verify the same document offline.
+
 Failure, rollback and operational impact of the checklist itself
 Failure. The CLI exits non-zero and prints the failing gate, the reason
 and the gate's rollback note. It never prints evidence text or environment
@@ -202,17 +267,24 @@ docs/AGENT_INCIDENT_RUNBOOK.md and the rollback-rehearsal gate.
 Artifacts. With --out, a deterministic JSON release record (statuses,
 commands and findings only; no timestamps unless --stamp). Two runs over
 the same inputs are byte-identical, so the record can be diffed.
+For machine-readable release review bundles, `npm run report:support-bundle`
+packages the public digests, versions and bounded findings into a reproducible
+support bundle with deterministic serialization and secret shape redaction.
 Secrets. None. The checklist reads tracked repo files only.
 Environment. No .env, no DATABASE_URL, no seeds, no network.
 Tests
 Bash
 
 node --import tsx --test tests/node/release-readiness.test.ts
-Coverage: positive (a fully evidenced release is ready), negative (unknown gate
-ids, non-pass/fail statuses, waiver keys and empty records are refused),
-failure (a failed gate and a secret-shaped detail both fail closed) and
-regression (the fingerprint, the documented gate list, the npm scripts, the
-declared paths and the CI wiring).
+node --import tsx --test tests/node/release-evidence-manifest.test.ts
+Coverage: positive (a fully evidenced release is ready, and a revision-bound
+manifest with verified artifact digests is ready), negative (unknown gate ids,
+non-pass/fail statuses, waiver keys and empty records are refused; mixed
+revisions, missing results, changed commands, stale schema identity and digest
+mismatches fail closed), failure (a failed gate, a secret-shaped detail, and
+escaping or symlinked artifact paths both fail closed) and regression (the
+fingerprint, the documented gate list, the npm scripts, the declared paths and
+the CI wiring).
 
 The CI tier matrix that decides which of these gates run for a given change is
 documented in [docs/CI_PATH_SCOPES.md](./CI_PATH_SCOPES.md), including the

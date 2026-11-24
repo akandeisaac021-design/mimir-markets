@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import Link from "next/link";
 import type { VSData } from "@/lib/contract";
@@ -30,6 +30,15 @@ import { nextXmtpFailure, type XmtpFailure } from "@/lib/xmtp/failure-state";imp
   normalizeXmtpMessageId,
   type OptimisticPendingMessage,
 } from "@/lib/xmtp/optimistic-send";
+import { sendXmtpTextWithAck } from "@/lib/xmtp/send-message";
+import { getMessagesHubConnectionState } from "@/lib/xmtp/messages-hub-state";
+import {
+  classifySendFailure,
+  describeMessagingReconnection,
+  INITIAL_MESSAGING_RECONNECTION_STATE,
+  reduceMessagingReconnection,
+} from "@/lib/xmtp/reconnection-state";
+import { clearXmtpDraft, readXmtpDraft, writeXmtpDraft } from "@/lib/xmtp/draft-store";
 import { GlassCard } from "@/components/ui";
 
 const XMTP_PANEL_TITLE_FALLBACK: Record<string, string> = {
@@ -75,7 +84,7 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
     }
     return v;
   }, [t, locale]);
-  const { address, isConnected, connect } = useWallet();
+  const { address, isConnected, connect, canSignMessages } = useWallet();
   const {
     client,
     status: xmtpStatus,
@@ -87,6 +96,13 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
   const [sendFailure, setSendFailure] = useState<XmtpFailure | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [draft, setDraft] = useState("");
+  // #933: user-readable reconnection state (connecting / ready / unavailable /
+  // uncertain_send). Pure reducer in lib/xmtp/reconnection-state.ts.
+  const [reconnection, dispatchReconnection] = useReducer(
+    reduceMessagingReconnection,
+    INITIAL_MESSAGING_RECONNECTION_STATE,
+  );
+  const reconnectionView = describeMessagingReconnection(reconnection);
   const [pendingSends, setPendingSends] = useState<OptimisticPendingMessage[]>(
     []
   );
@@ -103,8 +119,27 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
   useEffect(() => {
     setPendingSends([]);
     setSendFailure(null);
-    setDraft("");
-  }, [peerAddress]);
+    dispatchReconnection({ type: "uncertain_dismissed" });
+    // Restore this conversation's draft. Keyed by wallet + peer (not the XMTP
+    // inbox), so it is available before the client reconnects and never needs
+    // another wallet signature.
+    setDraft(readXmtpDraft(address, peerAddress));
+  }, [peerAddress, address]);
+
+  // Keep the stored draft in step with the composer so a reconnect or remount
+  // (which can hide the composer) does not lose what the user typed.
+  useEffect(() => {
+    writeXmtpDraft(address, peerAddress, draft);
+  }, [address, peerAddress, draft]);
+
+  const transport = getMessagesHubConnectionState({
+    canSignMessages,
+    status: xmtpStatus,
+    failureKind: xmtpFailure?.kind,
+  }).transport;
+  useEffect(() => {
+    dispatchReconnection({ type: "transport_changed", transport });
+  }, [transport]);
 
   useEffect(() => {
     if (!peerAddress || !client?.inboxId) {
@@ -272,31 +307,47 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
       { clientTempId, text, sentAt, status: "sending" },
     ]);
     try {
-      const rawId = await dm.sendText(text, true);
-      const serverMessageId =
-        rawId == null ? undefined : String(rawId);
-      setPendingSends((prev) =>
-        prev.map((p) =>
-          p.clientTempId === clientTempId
-            ? { ...p, serverMessageId, status: "sent" as const }
-            : p
-        )
-      );
-    } catch (e) {
-      setPendingSends((prev) =>
-        prev.filter((p) => p.clientTempId !== clientTempId)
-      );
-      const technical = e instanceof Error ? e.message : String(e);
-      // El texto vuelve al draft solo si el usuario no ha escrito otra cosa: un
-      // envío fallido nunca debe perder lo que la persona escribió.
-      setDraft((prev) => (prev.trim() ? prev : text));
-      setSendFailure((prev) =>
-        nextXmtpFailure(prev, "send_failed", technical)
-      );
+      const result = await sendXmtpTextWithAck(dm, text);
+      if (result.status === "accepted") {
+        clearXmtpDraft(address, peerAddress);
+        // A confirmed send settles any earlier "maybe delivered" message too:
+        // the user has seen the thread and chosen to continue.
+        dispatchReconnection({ type: "uncertain_dismissed" });
+        setPendingSends((prev) =>
+          prev.map((p) =>
+            p.clientTempId === clientTempId
+              ? {
+                  ...p,
+                  serverMessageId: result.serverMessageId,
+                  status: "accepted" as const,
+                }
+              : p
+          )
+        );
+      } else {
+        setPendingSends((prev) =>
+          prev.filter((p) => p.clientTempId !== clientTempId)
+        );
+        const technical =
+          result.error instanceof Error ? result.error.message : String(result.error);
+        // El texto vuelve al draft solo si el usuario no ha escrito otra cosa: un
+        // envío fallido nunca debe perder lo que la persona escribió.
+        setDraft((prev) => (prev.trim() ? prev : text));
+        if (classifySendFailure(result.error) === "uncertain") {
+          // The transport may have accepted the bytes before the error (network
+          // drop, timeout). Say so instead of "not sent", so the user checks the
+          // thread before resending and does not post the message twice.
+          dispatchReconnection({ type: "send_outcome_unknown", clientTempId });
+        } else {
+          setSendFailure((prev) =>
+            nextXmtpFailure(prev, "send_failed", technical)
+          );
+        }
+      }
     } finally {
       setIsSending(false);
     }
-  }, [dm, draft, clearThreadError]);
+  }, [dm, draft, clearThreadError, address, peerAddress]);
 
   const handleClearMyMessages = useCallback(() => {
     const myInbox = client?.inboxId;
@@ -726,7 +777,7 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
                           <p className="mt-1.5 text-[10px] text-pv-muted/75">
                             {pending.status === "sending"
                               ? t("sendingMessage")
-                              : t("messageQueued")}
+                              : t("messageAccepted")}
                           </p>
                         </div>
                       </div>
@@ -737,6 +788,30 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
             </div>
 
             <div className="bg-pv-bg/[0.08] px-3 pb-2.5 pt-1.5 sm:px-3.5 sm:pb-3 sm:pt-2">
+              <p
+                role="status"
+                aria-live="polite"
+                data-testid="xmtp-reconnection-status"
+                data-reconnection-status={reconnectionView.status}
+                className={`mb-1.5 text-[11px] leading-relaxed ${
+                  reconnectionView.status === "ready"
+                    ? "text-pv-muted/70"
+                    : reconnectionView.status === "uncertain_send"
+                      ? "text-amber-300"
+                      : "text-pv-muted"
+                }`}
+              >
+                {t(reconnectionView.messageKey)}
+                {reconnectionView.status === "uncertain_send" ? (
+                  <button
+                    type="button"
+                    className="ml-2 underline underline-offset-2 hover:text-pv-text"
+                    onClick={() => dispatchReconnection({ type: "uncertain_dismissed" })}
+                  >
+                    {t("reconnectUncertainDismiss")}
+                  </button>
+                ) : null}
+              </p>
               {sendFailure ? (
                 <div className="mb-2">
                   <XmtpFailureNotice
@@ -759,7 +834,7 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
-                        void handleSend();
+                        if (reconnectionView.canSend) void handleSend();
                       }
                     }}
                   />
@@ -769,7 +844,7 @@ export default function VsXmtpPanel({ vs, embedded = false }: VsXmtpPanelProps) 
                   variant="primary"
                   fullWidth={false}
                   className="h-[46px] shrink-0 px-5 !py-0 text-[13px] font-semibold sm:min-w-[5.25rem]"
-                  disabled={!draft.trim()}
+                  disabled={!draft.trim() || !reconnectionView.canSend}
                   onClick={() => void handleSend()}
                 >
                   {t("send")}
