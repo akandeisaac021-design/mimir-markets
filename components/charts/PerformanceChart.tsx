@@ -101,7 +101,10 @@ export function PerformanceChart({
   emptyMessage?: string;
   invalidMessage?: string;
   height?: number;
-  series?: ChartSeries[];
+  /** Structured observation-coverage metadata from the performance endpoint. */
+  coverage?: PerformanceObservationCoverage;
+  /** True when the newest observation predates the freshness window. */
+  stale?: boolean;
 }) {
   const gradientId = useId();
   const gapPatternId = useId();
@@ -173,7 +176,7 @@ export function PerformanceChart({
     const y = (value: number) =>
       VIEW_HEIGHT - PAD_Y - ((value - min) / span) * (VIEW_HEIGHT - PAD_Y * 2);
 
-    const buildSeriesGeom = (s: ChartSeries) => {
+      const buildSeriesGeom = (s: ChartSeries) => {
       const pts = s.points;
       if (pts.length === 0) {
         return {
@@ -182,6 +185,7 @@ export function PerformanceChart({
             y: number;
             timestamp: number;
             value: number;
+            coverage: ChartPoint["coverage"];
           }>,
           line: "",
           area: "",
@@ -194,6 +198,7 @@ export function PerformanceChart({
         y: y(point.value),
         timestamp: point.timestamp,
         value: point.value,
+        coverage: point.coverage,
       }));
       const line =
         pts.length === 1
@@ -206,28 +211,25 @@ export function PerformanceChart({
     };
 
     const seriesGeoms = allSeries.map(buildSeriesGeom);
-    const firstTimestamp = Math.min(...allPoints.map((p) => p.timestamp));
-    const lastTimestamp = Math.max(...allPoints.map((p) => p.timestamp));
-    return {
-      seriesGeoms,
-      baselineY: y(baseline),
-      firstTimestamp,
-      lastTimestamp,
-    };
-  }, [allSeries, baseline, invalid]);
-
     const primaryCoords = seriesGeoms[0]?.coords ?? [];
     const firstTimestamp = primaryCoords[0]?.timestamp ?? allPoints[0]?.timestamp ?? 0;
     const lastTimestamp =
       primaryCoords.at(-1)?.timestamp ?? allPoints.at(-1)?.timestamp ?? 0;
 
+    const gaps = normalizeMissingIntervals(
+      splitPointsByMissingIntervals(allSeries[0]?.points ?? []),
+    );
+    const gapRects = gaps.map((gap) => ({
+      x0: xForTimestamp(gap.fromTimestamp),
+      x1: xForTimestamp(gap.toTimestamp),
+    }));
+
     return {
       seriesGeoms,
-      line: seriesGeoms[0]?.line ?? "",
-      area: seriesGeoms[0]?.area ?? "",
       baselineY: y(baseline),
       firstTimestamp,
       lastTimestamp,
+      gapRects,
     };
   }, [allSeries, baseline, invalid]);
 

@@ -252,8 +252,6 @@ test("the signed realized-loss limit reserves the full next principal", () => {
   );
 });
 
-});
-
 test("open principal at risk is counted separately from realized (settled) loss", () => {
   // Before: a single realizedLossAtomic field conflated settled loss with open
   // principal — a position still open would be counted as already realized.

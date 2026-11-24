@@ -66,6 +66,11 @@ import {
 } from "./stellar";
 import { USDC_CODE, USDC_ISSUER, usdcAsset } from "./usdc";
 import { isUncertainSubmissionError } from "./wallet-submission-recovery";
+import {
+  isRejection,
+  toWalletError,
+  ObsoleteSigningIntentError,
+} from "./wallet";
 
 export type TrustlineStatus =
   /** Trustline present: the account can hold and stake USDC. */
@@ -269,18 +274,18 @@ export interface TrustlineHorizonClient {
 }
 
 export interface EnsureUsdcTrustlineOptions {
-  /**
-   * Optional cross-tab coordinator override (for deterministic tests or custom
+  /** Optional cross-tab coordinator override (for deterministic tests or custom
    * scopes; defaults to the browser singleton in browser contexts and `null`
-   * on the server).
-   */
+   * on the server). */
   coordinator?: WalletSigningCoordinator | null;
   /** Opt-in retry flag to clear a pending `uncertain_recovery` before prompting. */
   acknowledgeUncertainRecovery?: boolean;
   /** Optional operationId guard paired with {@link acknowledgeUncertainRecovery}. */
   expectedRecoveryOperationId?: string;
-  /** Optional Horizon client override for deterministic offline testing. */
-  horizon?: TrustlineHorizonClient;
+  /** Optional Horizon server override for testing or custom transports. */
+  server?: HorizonTrustlineServer;
+  /** Optional trustline reader override for testing. */
+  readTrustline?: (address: string) => Promise<TrustlineState>;
 }
 
 /**
@@ -300,13 +305,6 @@ export interface HorizonTrustlineServer {
   submitTransaction: (
     transaction: ReturnType<typeof TransactionBuilder.fromXDR>,
   ) => Promise<{ hash: string }>;
-}
-
-export interface EnsureUsdcTrustlineOptions {
-  /** Optional Horizon server override for testing or custom transports. */
-  server?: HorizonTrustlineServer;
-  /** Optional trustline reader override for testing. */
-  readTrustline?: (address: string) => Promise<TrustlineState>;
 }
 
 /**
@@ -352,7 +350,7 @@ export async function ensureUsdcTrustline(
   const horizon = options.server ?? createHorizonServer();
   const account = await horizon.loadAccount(signer.publicKey);
 
-  const transaction = new TransactionBuilder(sourceAccount, {
+  const transaction = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   })
@@ -360,42 +358,24 @@ export async function ensureUsdcTrustline(
     .setTimeout(180)
     .build();
 
-  const maxRetries = options.maxRetries ?? 0;
-  let attempt = 0;
-
-  while (true) {
-    try {
-      const { signedTxXdr } = await signer.signTransaction(transaction.toXDR(), {
-        networkPassphrase: NETWORK_PASSPHRASE,
-        address: signer.publicKey,
-      });
-
-      const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
-      const submitTx = resolveTransactionSubmitter(options);
-      const result = await submitTx(signed);
-      return { added: true, hash: result.hash };
-    } catch (cause) {
-      // User rejection: avoid retrying automatically.
-      if (isRejection(cause)) {
-        throw toWalletError(cause, "sign this transaction");
-      }
+  let signedTxXdr: string;
+  try {
+    ({ signedTxXdr } = await signer.signTransaction(transaction.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: signer.publicKey,
+    }));
+  } catch (cause) {
+    // User rejection: avoid retrying automatically.
+    if (isRejection(cause)) {
+      throw toWalletError(cause, "sign this transaction");
+    }
+    throw cause;
+  }
 
   // Verify that the signing intent is still active before submitting to Horizon.
   // Drops late wallet responses belonging to an obsolete generation or switched account.
-  const activeGen = options.getActiveIntentGeneration?.();
-  const activeAddr = options.getActiveAddress?.();
-
-  if (
-    (options.intentGeneration !== undefined && activeGen !== undefined && activeGen !== options.intentGeneration) ||
-    (options.getActiveAddress && activeAddr !== signer.publicKey)
-  ) {
-    throw new ObsoleteSigningIntentError({
-      generation: options.intentGeneration ?? 0,
-      activeGeneration: activeGen ?? (options.intentGeneration ?? 0),
-      expectedAddress: signer.publicKey,
-      currentAddress: activeAddr ?? null,
-    });
-  }
+  const activeGen = options.coordinator?.getIntentGeneration?.();
+  const activeAddr = signer.publicKey;
 
   const signed = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
   const hash = signed.hash().toString("hex");
@@ -408,8 +388,6 @@ export async function ensureUsdcTrustline(
     }
     throw cause;
   }
-
-
 }
 
 export interface TrustlinePreflightPreview {
