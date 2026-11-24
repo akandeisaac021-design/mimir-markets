@@ -81,12 +81,14 @@ lib/xmtp/
   XmtpProvider.tsx        # React context: Client.create / close / states
   failure-state.ts        # failure classification + retry policy (no SDK)
   vs-chat-eligibility.ts  # 1v1 accepted rules + peer resolution (no SDK)
+  conversation-binding.ts # market-context review before a hub conversation opens (no SDK)
   optimistic-send.ts      # remote + pending message merge (Step 7)
   index.ts                # safe barrel: re-exports config only
 components/xmtp/
   VsXmtpPanel.tsx         # DM panel + messages + stream + optimistic send (Steps 5–7)
   XmtpFailureNotice.tsx   # shared failure + retry notice (accessibility, i18n)
   MessagesHub.tsx         # /messages hub: list claims with active XMTP chat
+  ConversationBindingReview.tsx # review panel shown before a hub conversation opens
 ```
 
 Import **`XmtpProvider` and `useXmtp`** from `@/lib/xmtp/XmtpProvider` (not from `index.ts`) to avoid accidentally loading the SDK in Server Components.
@@ -221,6 +223,21 @@ Every failing state also sets `failure` (an `XmtpFailure` from `lib/xmtp/failure
 | Failure fixtures are deterministic | `tests/fixtures/xmtp/message-hub-failures.ts`, `tests/node/messages-hub-failures.test.ts` |
 
 A wallet switch does not unmount the hub, so the previous account's rows are derived away instead of being cleared in an effect: `messagesHubVisibleThreads` returns nothing unless the loaded rows carry the current address. The private-context check runs before rendering `VsXmtpPanel` (the only place message bodies appear), so an account switch hides the panel even if the selection state has not been reset yet. The same fixtures cover each transport outcome and an expired context.
+
+**Market-context binding review (#928)**
+
+Selecting a live channel in the hub no longer opens the conversation directly. The chat panel first shows a review of the market (`VS #id` and question) and both participants (the connected account and the on-chain counterpart), and `VsXmtpPanel` mounts only after the user presses **Start private chat**.
+
+| Rule | Implementation |
+|------|----------------|
+| Review values come from the rows fetched for the connected account, never from the URL | `lib/xmtp/conversation-binding.ts` — `buildConversationBindingReview` (refuses rows loaded for another account, unknown or ineligible markets, non-participants) |
+| A confirmation is a fingerprint of what was reviewed (version, market id, viewer, peer, state, question) | `confirmConversationBinding` |
+| The conversation opens only while the confirmation matches the current selection, account and trusted rows; otherwise the review is shown again with the reason | `resolveConversationBinding` (`not_confirmed`, `selection_changed`, `account_changed`, `context_changed`); gate in `components/xmtp/MessagesHub.tsx` |
+| Optional deep link `/messages?vs=<id>&peer=<address>` is an untrusted hint: it can preselect a thread for review, never open it; a hint that disagrees with trusted context opens nothing and shows a notice | `parseConversationNavigationHint`, `resolveConversationNavigationHint` (`malformed_hint`, `market_not_found`, `not_eligible`, `not_participant`, `peer_mismatch`, `context_not_loaded`) |
+| Review panel | `components/xmtp/ConversationBindingReview.tsx`; strings under `messagesHub.binding*` in `messages/en.json` |
+| Tests | `tests/node/xmtp-conversation-binding.test.ts` |
+
+Existing behaviour is unchanged otherwise: `/messages` without query parameters works as before, non-eligible ("Other duels") rows render as before, and the `/vs/[id]` detail-page panel is not affected.
 
 ## 12. Step 7 — Done ✓ (optimistic send)
 
