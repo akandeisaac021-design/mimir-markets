@@ -225,12 +225,35 @@ export interface ChallengeIntentReview {
 type GenerationRef = { current: number };
 
 /** Build a deterministic revision key from claim, account and amount. */
-function buildRevisionKey(
+export function buildChallengeRevisionKey(
   claimStatement: string | null,
   account: string | null | undefined,
   stakeAmount: number | null
 ): string {
   return JSON.stringify([claimStatement ?? "", account ?? "", stakeAmount ?? null]);
+}
+
+/**
+ * Returns true only when a captured review still matches the current market
+ * claim statement, connected wallet account, and integer USDC stake.
+ */
+export function isChallengeIntentReviewValid(
+  review: ChallengeIntentReview | null,
+  current: {
+    claimStatement: string | null;
+    account: string | null | undefined;
+    stakeAmount: number | null;
+  }
+): boolean {
+  if (!review) return false;
+  return (
+    review.revisionKey ===
+    buildChallengeRevisionKey(
+      current.claimStatement,
+      current.account,
+      current.stakeAmount
+    )
+  );
 }
 
 // ── Hook implementation ───────────────────────────────────────────────────────
@@ -310,7 +333,7 @@ export function useVsDetail({
   const [intentReview, setIntentReview] = useState<ChallengeIntentReview | null>(null);
 
   const currentStakeAmount = Number.parseInt(challengeStake, 10);
-  const currentRevisionKey = buildRevisionKey(
+  const currentRevisionKey = buildChallengeRevisionKey(
     vs?.claim_statement ?? null,
     address,
     Number.isFinite(currentStakeAmount) ? currentStakeAmount : null

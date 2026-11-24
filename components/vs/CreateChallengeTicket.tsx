@@ -2,7 +2,7 @@
 
 import { Activity } from "lucide-react";
 import { createHash } from "crypto";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { useEffect, useMemo, useState } from "react";
 import { formatDeadline } from "@/lib/constants";
 import { evaluateMarketExpiry } from "@/lib/market-expiry";
@@ -15,6 +15,27 @@ import {
 import { parsePrefillParams } from "@/lib/mirror-prefill";
 
 export type ChallengeSide = "yes" | "no";
+
+/**
+ * Deterministic 16-hex-char revision digest binding the challenge ticket review
+ * to the connected account, stake amount, and claim statement. Any change to
+ * those fields produces a different digest and invalidates a prior review.
+ */
+export function computeChallengeTicketRevision(input: {
+  account: string | null | undefined;
+  stakeAmount: number;
+  claim: string;
+}): string {
+  const stakeKey = Number.isFinite(input.stakeAmount)
+    ? input.stakeAmount.toFixed(2)
+    : "invalid";
+  const payload = JSON.stringify({
+    account: input.account ?? null,
+    amount: stakeKey,
+    claim: input.claim.trim(),
+  });
+  return createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
 
 
 function truncate(s: string, max: number) {
@@ -170,17 +191,15 @@ export default function CreateChallengeTicket({
   const stakeStr = Number.isFinite(effectiveStake)
     ? effectiveStake.toFixed(2)
     : "—";
-  const stakeKey = Number.isFinite(effectiveStake)
-    ? effectiveStake.toFixed(2)
-    : "invalid";
-  const reviewRevision = useMemo(() => {
-    const payload = JSON.stringify({
-      account: walletAddress ?? null,
-      amount: stakeKey,
-      claim: settlementPreview.trim(),
-    });
-    return createHash("sha256").update(payload).digest("hex").slice(0, 16);
-  }, [walletAddress, stakeKey, settlementPreview]);
+  const reviewRevision = useMemo(
+    () =>
+      computeChallengeTicketRevision({
+        account: walletAddress,
+        stakeAmount: effectiveStake,
+        claim: settlementPreview,
+      }),
+    [walletAddress, effectiveStake, settlementPreview],
+  );
   const [reviewedRevision, setReviewedRevision] = useState<string | null>(null);
   const reviewValid = reviewedRevision === reviewRevision;
   const body = truncate(settlementPreview.trim(), 240);
