@@ -63,6 +63,10 @@ remediation command. They never include row data, addresses, or secrets.
 
 `npm run report:support-bundle` (and `npm run report:support-bundle -- --json` or `--out <file>`) packages the offline schema snapshot fingerprint and drift report alongside contract Wasm digests and release readiness validation into a reproducible, deterministic bundle. Like the snapshot gate, it reads only public committed artifacts, never accesses `process.env` or a live database, and scrubs secret-shaped strings.
 
+## Offline rollback readiness report
+
+`npm run report:rollback-readiness` reuses the snapshot checks above to state the schema assumptions a rollback makes (committed snapshot present, source schema matches it, migration versions unique, migrations registered) next to the pinned Wasm digests and rollback runbooks, and lists the blockers it observed. Drift is an error in both modes; it never writes the snapshot or touches a database. See `docs/ROLLBACK.md`.
+
 ## Release, rollback, artifact, and environment
 
 - **Release.** CI runs `npm run check:schema-snapshot` before typecheck. A failing
