@@ -442,20 +442,19 @@ input.globalPaused ? "global_paused" : "permission_paused",
 
   if (isStale) {
     status = "stale";
-if (isStale) {
-  status = "stale";
-  reasonCode = "snapshot_stale";
-  detail =
-    "Permission or on-chain allowance snapshot may be stale; refresh to confirm latest ledger state.";
-} else if (!hasSufficientAllowance) {
-  status = "invalid";
-  reasonCode = "allowance_insufficient";
-  detail =
-    onchainAllowance === 0n
-      ? "On-chain USDC allowance is zero; the spender cannot execute copies until allowance is raised."
-      : "On-chain USDC allowance is lower than the per-position bound.";
+    reasonCode = "snapshot_stale";
+    detail =
+      "Permission or on-chain allowance snapshot may be stale; refresh to confirm latest ledger state.";
+  } else if (!hasSufficientAllowance) {
+    status = "invalid";
+    reasonCode = "allowance_insufficient";
+    detail =
+      onchainAllowance === 0n
+        ? "On-chain USDC allowance is zero; the spender cannot execute copies until allowance is raised."
+        : "On-chain USDC allowance is lower than the per-position bound.";
   } else if (!hasSufficientBalance) {
-    status = "ready";
+    status = "invalid";
+    reasonCode = "balance_insufficient";
     detail = "On-chain USDC balance is below the per-position stake cap; execution may fail until balance is topped up.";
   }
 
@@ -470,14 +469,14 @@ if (isStale) {
     totalOpenExposureAtomic: totalOpenExposureAtomic.toString(),
     maxRealizedLossAtomic: p.maxRealizedLossAtomic,
     signedAllowanceAtomic: signedAllowance.toString(),
-principalAtRiskAtomic:
-  input.principalAtRiskAtomic !== undefined
-    ? input.principalAtRiskAtomic.toString()
-    : null,
-onchainAllowanceAtomic:
-  onchainAllowance === null ? null : onchainAllowance.toString(),
-onchainBalanceAtomic:
-  onchainBalance === null ? null : onchainBalance.toString(),
+    principalAtRiskAtomic:
+      input.principalAtRiskAtomic !== undefined
+        ? input.principalAtRiskAtomic.toString()
+        : null,
+    onchainAllowanceAtomic:
+      onchainAllowance === null ? null : onchainAllowance.toString(),
+    onchainBalanceAtomic:
+      onchainBalance === null ? null : onchainBalance.toString(),
     remainingAllowanceAtomic: remaining.toString(),
     hasSufficientAllowance,
     hasSufficientBalance,
@@ -489,8 +488,7 @@ onchainBalanceAtomic:
     minConfidenceBps: p.minConfidenceBps,
     minPayoutBps: p.minPayoutBps,
     expiresAt: p.expiresAt,
-  };
-
+  });
 }
 
 /**
@@ -514,6 +512,8 @@ export function evaluateCopyPermissionSnapshot(
     onchainAllowanceAtomic: null,
   });
 }
+
+/**
  * Spend-permission explanation used by the revoke confirmation dialog.
  *
  * Revoking a copy permission is owner-signed and stops Mimir from executing

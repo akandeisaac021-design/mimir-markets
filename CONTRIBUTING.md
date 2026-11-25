@@ -96,7 +96,7 @@ npm run check:locales:strict # Locale completeness check (non-strict: npm run ch
 npm run check:driver-parity  # CI path-scope parity check
 npm run check:openapi        # Agent OpenAPI contract check (-- --write to regenerate)
 npm run verify:cache-backup -- tests/fixtures/cache-backup/valid.json
-npm run verify:release-readiness
+npm run verify:release-readiness # Release checklist (-- --manifest <file> for revision-bound evidence)
 npm run report:support-bundle # Offline artifact and schema support bundle
 npm run report:rollback-readiness # Offline rollback readiness report (artifacts, schema assumptions, blockers)
 npm run test:node            # Full Node test suite (alias: npm run test:smoke)

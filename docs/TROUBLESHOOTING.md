@@ -118,10 +118,10 @@ This guide collects causes, code references, and fixes for errors contributors, 
   3. An out-of-band transaction was submitted from another client (e.g. manual CLI or wallet extension), causing local sequence state to drift.
 - **Fix**:
   1. Avoid sharing the same secret seed across multiple concurrent processes or agent workers.
-  2. In application code, use `SequenceManager` (`lib/agents/sequence-manager.ts`), which handles sequential reservation and automatically resyncs via `resync(address)` upon encountering `tx_bad_seq`.
-  3. If an autonomous worker process logs `tx_bad_seq`, restart the worker so it performs a fresh sequence read from Horizon.
+  2. In application code, use `SequenceManager` (`lib/agents/sequence-manager.ts`), which binds reservations to the selected Stellar network (`NEXT_PUBLIC_STELLAR_NETWORK` / `STELLAR_NETWORK` and optional network passphrase), rejects reuse after a network configuration change (`SequenceNetworkMismatchError`), preserves independent streams per account, and resyncs via `resync(address)` upon encountering `tx_bad_seq`.
+  3. If an autonomous worker process logs `tx_bad_seq` or `SequenceNetworkMismatchError`, restart the worker (or instantiate a new `SequenceManager` for the updated network) so it performs a fresh sequence read from Horizon.
 - **Code Location**:
-  - `lib/agents/sequence-manager.ts:6-29, 187` (`SequenceManager.resync`)
+  - `lib/agents/sequence-manager.ts` (`SequenceManager`, `SequenceNetworkMismatchError`, `SequenceManager.resync`)
   - `lib/settlement-retry.ts:235-243` (`classifySettlementError`)
 
 ---
@@ -376,6 +376,16 @@ When `estimateStale` is set the market page labels the deadline "estimate may be
   - `hooks/useVsDetail.ts` (`challengeRecovery`, `beginChallengeRecovery`, `checkChallengeRecovery`, `dismissChallengeRecovery`)
   - `components/vs/ChallengeRecoveryPanel.tsx` (UI)
   - `app/[locale]/vs/[id]/page.tsx` (`handleAccept` pending/uncertain paths)
+
+### 21. Screen-Reader Focus & Announcements After Challenge Result Refresh
+
+- **Behavior**:
+  - Only relevant `submitted` or `confirmed` challenge state transitions are announced in a polite live region (`role="status"`, `aria-live="polite"`, `aria-atomic="true"`). Routine background polls, idle refreshes, failed recovery states, already-confirmed initial loads, and stale fetch generations remain silent.
+  - When a refresh removes or disables the currently focused challenge action (for example `accept-stake` -> `check-status` -> `dismiss-recovery`, or `confirm-review` -> `refresh-result`), keyboard focus moves to the equivalent surviving action rather than dropping to `document.body`. Focus is never stolen if the user is focused outside the challenge controls.
+- **Interface**:
+  - `lib/challenge-refresh-focus.ts` (`deriveChallengeResultState`, `buildChallengeRefreshAnnouncement`, `resolveSurvivingChallengeAction`, `applyChallengeRefreshFocusTransition`, `restoreFocusToChallengeAction`)
+  - `hooks/useVsDetail.ts` (`challengeResultState`, `challengeRefreshAnnouncement`, `resolveFocusAfterRefresh`)
+  - `components/vs/CreateChallengeTicket.tsx` (optional `challengeResultState`, `resultTxHash`, `onRefreshResult` props; `data-testid="challenge-result-live-region"` and `data-challenge-action` markers)
 
 ---
 

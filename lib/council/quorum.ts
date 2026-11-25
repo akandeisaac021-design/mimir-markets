@@ -75,6 +75,8 @@ export type VoteDisposition =
   | "cancelled"
   | "paused"
   | "dependency_failure"
+  | "equivocation"
+  | "expired"
   /**
    * Persona did not vote before the council deliberation deadline. Counted as
    * abstention (never as a decisive or DRAW vote) so missing votes cannot be
@@ -187,6 +189,16 @@ export interface VoteAttemptInput {
   statementDigest?: string;
   /** Expected statement digest; mismatch classifies attempt as stale. */
   expectedStatementDigest?: string;
+  /** Optional arrival/delivery identity for retry deduplication. */
+  arrivalId?: string;
+  /** True when this vote submission or ballot is explicitly expired. */
+  expired?: boolean;
+  /** Deadline timestamp in ms; submission past this is marked expired. */
+  ballotDeadlineMs?: number;
+  /** Submission timestamp in ms. */
+  submittedAtMs?: number;
+  /** Explicitly marks this attempt as an equivocation / conflicting vote. */
+  equivocated?: boolean;
 }
 
 export interface ClassifiedVote {
@@ -222,6 +234,51 @@ export interface DuplicateVoteConflict {
   reason: string;
 }
 
+export type CouncilAgreementStatus = "measured" | "absent_ballot";
+
+/**
+ * Agreement percentage paired with its valid eligible vote sample size (`n`).
+ *
+ * - When at least one valid eligible vote is present (`sampleSize > 0`),
+ *   `status` is `"measured"` and `agreementPct` is an integer 0..100 (where
+ *   `0` means a real ballot with zero votes agreeing with the target/decisive
+ *   side).
+ * - When no valid eligible votes exist (`sampleSize === 0`), `status` is
+ *   `"absent_ballot"` and `agreementPct` is `null` so an absent ballot is
+ *   never displayed or interpreted as 0% agreement.
+ */
+export interface CouncilAgreementSummary {
+  status: CouncilAgreementStatus;
+  /** Valid eligible votes used as the denominator (`n`). */
+  sampleSize: number;
+  /** Valid eligible votes matching `verdict` (0 when absent or none match). */
+  agreeingVotes: number;
+  /** Integer percentage 0..100 when measured, or `null` when ballot is absent. */
+  agreementPct: number | null;
+  /** Target or leading decisive verdict, or `null` when absent/tied/non-decisive. */
+  verdict: Verdict | null;
+  /** Total vote attempts inspected before filtering to valid eligible votes. */
+  totalAttempts: number;
+  /** Attempts excluded from the denominator (invalid, stale, duplicate, ineligible, etc.). */
+  excludedCount: number;
+  /** Formatted string pairing agreement percentage with sample size (or absent ballot label). */
+  display: string;
+}
+
+export interface CouncilAgreementOptions {
+  /**
+   * Optional set of eligible persona slugs. When supplied, only valid votes
+   * from personas in this set enter the denominator (case-insensitive).
+   */
+  eligibleVoteSet?: readonly string[];
+  /**
+   * Optional target verdict to measure agreement against. When omitted,
+   * measures agreement on the leading decisive verdict (`CREATOR_WINS` or
+   * `CHALLENGERS_WIN`).
+   */
+  targetVerdict?: Verdict;
+}
+
 export interface QuorumEvaluation {
   action: FallbackAction;
   quorum: number;
@@ -229,11 +286,17 @@ export interface QuorumEvaluation {
   policyRevision: string;
   decisiveCount: number;
   acceptedCount: number;
+  /** Number of valid eligible votes in the evaluated ballot (sample size `n`). */
+  sampleSize: number;
+  /** Agreement percentage paired with sample size (distinguishes absent ballot from 0%). */
+  agreement: CouncilAgreementSummary;
   dispositions: Record<VoteDisposition, number>;
   reason: string;
   acceptedSlugs: string[];
   /** Valid votes in ballot order (duplicates / rejects excluded). */
   ballot: ClassifiedVote[];
+  /** Conflicting duplicate vote records, when any. */
+  conflicts?: DuplicateVoteConflict[];
   /** Optional operator independence assessment of the decisive ballot. */
   independence?: QuorumIndependenceEvaluation;
 }
@@ -246,6 +309,8 @@ const EMPTY_DISPOSITIONS = (): Record<VoteDisposition, number> => ({
   cancelled: 0,
   paused: 0,
   dependency_failure: 0,
+  equivocation: 0,
+  expired: 0,
   deadline_abstention: 0,
 });
 
@@ -586,6 +651,7 @@ export function buildBallot(attempts: readonly ClassifiedVote[]): {
 } {
   const ballot: ClassifiedVote[] = [];
   const rejected: ClassifiedVote[] = [];
+  const conflicts: DuplicateVoteConflict[] = [];
   const seenSlugs = new Set<string>();
 
   for (const attempt of attempts) {
@@ -609,6 +675,117 @@ export function buildBallot(attempts: readonly ClassifiedVote[]): {
   return { ballot, rejected, conflicts };
 }
 
+/**
+ * Format an agreement percentage alongside its valid eligible vote sample size.
+ *
+ * Distinguishes an absent ballot (`sampleSize === 0` or `agreementPct === null`)
+ * from a real ballot with 0% agreement (`0% (0/n, n=n)`).
+ */
+export function formatAgreementWithSampleSize(
+  summary: Pick<CouncilAgreementSummary, "status" | "agreementPct" | "agreeingVotes" | "sampleSize">,
+): string {
+  if (
+    summary.status === "absent_ballot" ||
+    summary.sampleSize <= 0 ||
+    summary.agreementPct === null
+  ) {
+    return "No ballot (n=0)";
+  }
+  return `${summary.agreementPct}% (${summary.agreeingVotes}/${summary.sampleSize}, n=${summary.sampleSize})`;
+}
+
+/**
+ * Summarize council agreement percentage alongside sample size using only
+ * valid eligible votes as the denominator.
+ *
+ * Invalid, stale, duplicated, cancelled, paused, expired, equivocated,
+ * dependency-failure, deadline-abstention, and ineligible-voter attempts are
+ * excluded from the denominator. An absent ballot (`sampleSize === 0`) yields
+ * `status: "absent_ballot"` and `agreementPct: null` rather than `0%`.
+ */
+export function summarizeCouncilAgreement(
+  attempts: readonly ClassifiedVote[],
+  opts?: CouncilAgreementOptions,
+): CouncilAgreementSummary {
+  const { ballot } = buildBallot(attempts);
+  const eligibleSet =
+    opts?.eligibleVoteSet !== undefined
+      ? new Set(
+          opts.eligibleVoteSet
+            .map((s) => (typeof s === "string" ? s.trim().toLowerCase() : ""))
+            .filter(Boolean),
+        )
+      : null;
+
+  const validEligible = ballot.filter((v) => {
+    const slug = (v.slug ?? "").trim().toLowerCase();
+    if (!slug) return false;
+    if (eligibleSet !== null && !eligibleSet.has(slug)) return false;
+    return v.verdict !== undefined && isVerdict(v.verdict);
+  });
+
+  const sampleSize = validEligible.length;
+  const totalAttempts = attempts.length;
+  const excludedCount = Math.max(0, totalAttempts - sampleSize);
+
+  if (sampleSize === 0) {
+    const absent: CouncilAgreementSummary = {
+      status: "absent_ballot",
+      sampleSize: 0,
+      agreeingVotes: 0,
+      agreementPct: null,
+      verdict: null,
+      totalAttempts,
+      excludedCount,
+      display: "No ballot (n=0)",
+    };
+    return absent;
+  }
+
+  let agreeingVotes = 0;
+  let verdict: Verdict | null = null;
+
+  if (opts?.targetVerdict !== undefined) {
+    verdict = opts.targetVerdict;
+    agreeingVotes = validEligible.filter((v) => v.verdict === opts.targetVerdict).length;
+  } else {
+    let creator = 0;
+    let challengers = 0;
+    for (const v of validEligible) {
+      if (v.verdict === "CREATOR_WINS") creator += 1;
+      else if (v.verdict === "CHALLENGERS_WIN" || (v.verdict as string) === "CHALLENGERS_WINS") {
+        challengers += 1;
+      }
+    }
+    if (creator === 0 && challengers === 0) {
+      agreeingVotes = 0;
+      verdict = null;
+    } else if (creator > challengers) {
+      agreeingVotes = creator;
+      verdict = "CREATOR_WINS";
+    } else if (challengers > creator) {
+      agreeingVotes = challengers;
+      verdict = "CHALLENGERS_WIN";
+    } else {
+      agreeingVotes = creator;
+      verdict = null;
+    }
+  }
+
+  const agreementPct = Math.round((agreeingVotes / sampleSize) * 100);
+  const status: CouncilAgreementStatus = "measured";
+  return {
+    status,
+    sampleSize,
+    agreeingVotes,
+    agreementPct,
+    verdict,
+    totalAttempts,
+    excludedCount,
+    display: formatAgreementWithSampleSize({ status, agreementPct, agreeingVotes, sampleSize }),
+  };
+}
+
 function countDispositions(votes: readonly ClassifiedVote[]): Record<VoteDisposition, number> {
   const counts = EMPTY_DISPOSITIONS();
   for (const v of votes) {
@@ -628,6 +805,18 @@ export interface QuorumEvaluationOptions {
    * falling back to the default.
    */
   strictConfig?: boolean;
+  /** Optional eligible persona slugs for agreement denominator filtering. */
+  eligibleVoteSet?: readonly string[];
+  /** Explicit ballot expiry flag. */
+  ballotExpired?: boolean;
+  /** Maximum ballot age in ms. */
+  maxBallotAgeMs?: number;
+  /** Observed ballot age in ms. */
+  ballotAgeMs?: number;
+  /** Ballot deadline epoch ms. */
+  ballotDeadlineMs?: number;
+  /** Current clock epoch ms (for deterministic testing). */
+  nowMs?: number;
 }
 
 /**
@@ -653,6 +842,7 @@ export function evaluateQuorum(
   const claimState = opts?.claimState;
   const quorum = normalizeQuorum(quorumRaw);
   const policyRevision = policyRevisionFor(quorum);
+  const absentAgreement = summarizeCouncilAgreement([]);
 
   if (claimState === "cancelled") {
     return {
@@ -661,6 +851,8 @@ export function evaluateQuorum(
       policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
+      sampleSize: 0,
+      agreement: absentAgreement,
       dispositions: countDispositions(attempts),
       reason: "claim is cancelled on-chain — council settlement aborted",
       acceptedSlugs: [],
@@ -676,6 +868,8 @@ export function evaluateQuorum(
       policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
+      sampleSize: 0,
+      agreement: absentAgreement,
       dispositions: countDispositions(attempts),
       reason: "claim is already resolved — council settlement aborted",
       acceptedSlugs: [],
@@ -691,6 +885,8 @@ export function evaluateQuorum(
       policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
+      sampleSize: 0,
+      agreement: absentAgreement,
       dispositions: countDispositions(attempts),
       reason: "claim is paused — council settlement aborted",
       acceptedSlugs: [],
@@ -711,13 +907,17 @@ export function evaluateQuorum(
   if (isExpired) {
     return {
       action: "abort_expired",
-      quorum: normalizeQuorum(quorumRaw),
+      quorum,
+      policyRevision,
       decisiveCount: 0,
       acceptedCount: 0,
+      sampleSize: 0,
+      agreement: absentAgreement,
       dispositions: countDispositions(attempts),
       reason: "ballot expired — council settlement aborted",
       acceptedSlugs: [],
       ballot: [],
+      conflicts: [],
     };
   }
 
@@ -728,6 +928,8 @@ export function evaluateQuorum(
       policyRevision: policyRevisionFor(0),
       decisiveCount: 0,
       acceptedCount: 0,
+      sampleSize: 0,
+      agreement: absentAgreement,
       dispositions: countDispositions(attempts),
       reason: `invalid COUNCIL_QUORUM value: ${String(quorumRaw)}`,
       acceptedSlugs: [],
@@ -736,17 +938,15 @@ export function evaluateQuorum(
     };
   }
 
-  const quorum = normalizeQuorum(quorumRaw);
   const { ballot, rejected, conflicts } = buildBallot(attempts);
   const all = [...ballot, ...rejected];
   const dispositions = countDispositions(all);
   const decisive = ballot.filter((v) => v.decisive);
   const decisiveCount = decisive.length;
   const acceptedSlugs = ballot.map((v) => v.slug);
-  const commitmentProps =
-    verifiedCommitment !== undefined
-      ? { commitment: verifiedCommitment, commitmentValid: true }
-      : {};
+  const agreement = summarizeCouncilAgreement(attempts, {
+    eligibleVoteSet: opts?.eligibleVoteSet,
+  });
 
   if (decisiveCount >= quorum) {
     return {
@@ -755,8 +955,10 @@ export function evaluateQuorum(
       policyRevision,
       decisiveCount,
       acceptedCount: ballot.length,
+      sampleSize: agreement.sampleSize,
+      agreement,
       dispositions,
-      reason: `quorum met: ${decisiveCount}/${quorum} decisive votes`,
+      reason: `quorum met: ${decisiveCount}/${quorum} decisive votes (${agreement.display})`,
       acceptedSlugs,
       ballot,
       conflicts,
@@ -765,22 +967,10 @@ export function evaluateQuorum(
 
   const dep = dispositions.dependency_failure;
   const paused = dispositions.paused;
-  const reasonParts = [
-    `below quorum: ${decisiveCount}/${quorum} decisive votes — solo fallback`,
-    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
-    dispositions.stale ? `${dispositions.stale} stale` : null,
-    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
-    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
-    paused ? `${paused} paused` : null,
-    dep ? `${dep} dependency_failure` : null,
-  ].filter(Boolean);
-
-  const dep = dispositions.dependency_failure;
-  const paused = dispositions.paused;
   const equiv = dispositions.equivocation;
   const expired = dispositions.expired;
   const reasonParts = [
-    `below quorum: ${decisiveCount} decisive < ${quorum}`,
+    `below quorum: ${decisiveCount} decisive < ${quorum} (${agreement.display})`,
     dispositions.invalid ? `${dispositions.invalid} invalid` : null,
     dispositions.stale ? `${dispositions.stale} stale` : null,
     dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
@@ -791,40 +981,18 @@ export function evaluateQuorum(
     expired ? `${expired} expired` : null,
   ].filter(Boolean);
 
-  const dep = dispositions.dependency_failure;
-  const paused = dispositions.paused;
-  const reasonParts = [
-    `below quorum: ${decisiveCount} decisive < ${quorum}`,
-    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
-    dispositions.stale ? `${dispositions.stale} stale` : null,
-    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
-    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
-    paused ? `${paused} paused` : null,
-    dep ? `${dep} dependency_failure` : null,
-  ].filter(Boolean);
-
-  const dep = dispositions.dependency_failure;
-  const paused = dispositions.paused;
-  const reasonParts = [
-    `below quorum: ${decisiveCount} decisive < ${quorum}`,
-    dispositions.invalid ? `${dispositions.invalid} invalid` : null,
-    dispositions.stale ? `${dispositions.stale} stale` : null,
-    dispositions.duplicated ? `${dispositions.duplicated} duplicated` : null,
-    dispositions.cancelled ? `${dispositions.cancelled} cancelled` : null,
-    paused ? `${paused} paused` : null,
-    dep ? `${dep} dependency_failure` : null,
-  ].filter(Boolean);
-
   return {
     action: "fallback_solo",
     quorum,
     policyRevision,
     decisiveCount,
     acceptedCount: ballot.length,
+    sampleSize: agreement.sampleSize,
+    agreement,
     dispositions,
     reason: reasonParts.join("; "),
     acceptedSlugs,
     ballot,
-    ...(independence ? { independence } : {}),
+    conflicts,
   };
 }

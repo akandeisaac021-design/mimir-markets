@@ -42,6 +42,13 @@
  *     Recovery never resubmits — the Soroban contract state stays
  *     authoritative.
  *
+ *  9. **Screen-reader focus & announcement preservation.** Across challenge
+ *     result refreshes, the hook derives `challengeResultState` and emits
+ *     `challengeRefreshAnnouncement` only for relevant `"submitted"` or
+ *     `"confirmed"` transitions (deduplicated across routine polls), and
+ *     exposes `resolveFocusAfterRefresh` so keyboard focus stays on the
+ *     focused action or moves to its equivalent surviving action.
+ *
  * The hook is purely logic.  No JSX, no toast side-effects — all of that stays
  * in the page component so the boundary between state and rendering is clear.
  */
@@ -80,6 +87,14 @@ import {
   type ExpiryObservation,
   type MarketExpiry,
 } from "@/lib/market-expiry";
+import {
+  buildChallengeRefreshAnnouncement,
+  deriveChallengeResultState,
+  resolveSurvivingChallengeAction,
+  type ChallengeActionId,
+  type ChallengeRefreshAnnouncement,
+  type ChallengeResultState,
+} from "@/lib/challenge-refresh-focus";
 import type { VSData } from "@/lib/contract";
 import type { VSCacheFreshness } from "@/lib/vs-freshness";
 
@@ -107,6 +122,11 @@ export interface ActivityRow {
 export { VS_DETAIL_POLL_INTERVAL_MS, VS_DETAIL_MAX_ATTEMPTS } from "@/lib/vs-detail-state";
 export { CHALLENGE_RECOVERY_MAX_STATUS_CHECKS } from "@/lib/challenge-recovery";
 export type { ChallengeRecoveryRecord };
+export type {
+  ChallengeActionId,
+  ChallengeRefreshAnnouncement,
+  ChallengeResultState,
+};
 import type { VsDetailPhase } from "@/lib/vs-detail-state";
 export type { VsDetailPhase };
 
@@ -199,6 +219,25 @@ export interface UseVsDetailResult {
    * re-authorization while this is non-null for the current account.
    */
   authorizationClearedFor: string | null;
+  /**
+   * Current challenge result state relevant to screen-reader announcements
+   * (`"idle" | "submitted" | "confirmed"`).
+   */
+  challengeResultState: ChallengeResultState;
+  /**
+   * Polite live-region announcement for the latest relevant submitted or
+   * confirmed challenge transition, or `null` when nothing relevant changed.
+   */
+  challengeRefreshAnnouncement: ChallengeRefreshAnnouncement | null;
+  /**
+   * Resolve which challenge action should retain keyboard focus after a
+   * refresh: preserves `activeAction` if it survives, otherwise selects its
+   * equivalent surviving fallback, or `null` when focus was outside the flow.
+   */
+  resolveFocusAfterRefresh: (
+    activeAction: ChallengeActionId | null,
+    survivingActions: readonly ChallengeActionId[]
+  ) => ChallengeActionId | null;
 }
 
 /**
@@ -225,12 +264,47 @@ export interface ChallengeIntentReview {
 type GenerationRef = { current: number };
 
 /** Build a deterministic revision key from claim, account and amount. */
-function buildRevisionKey(
+export function buildChallengeRevisionKey(
   claimStatement: string | null,
   account: string | null | undefined,
   stakeAmount: number | null
 ): string {
   return JSON.stringify([claimStatement ?? "", account ?? "", stakeAmount ?? null]);
+}
+
+/**
+ * Returns true only when a captured review still matches the current market
+ * claim statement, connected wallet account, and integer USDC stake.
+ */
+export function isChallengeIntentReviewValid(
+  review: ChallengeIntentReview | null,
+  current: {
+    claimStatement: string | null;
+    account: string | null | undefined;
+    stakeAmount: number | null;
+  }
+): boolean {
+  if (!review) return false;
+  return (
+    review.revisionKey ===
+    buildChallengeRevisionKey(
+      current.claimStatement,
+      current.account,
+      current.stakeAmount
+    )
+  );
+}
+
+/** True when `viewer` appears as a confirmed challenger in the market snapshot. */
+function isViewerChallenger(
+  snapshot: VSData | null,
+  viewer: string | null | undefined
+): boolean {
+  if (!snapshot || !viewer) return false;
+  if (snapshot.opponent && snapshot.opponent === viewer) return true;
+  if (snapshot.challenger_addresses?.includes(viewer)) return true;
+  if (snapshot.challengers?.some((c) => c.address === viewer)) return true;
+  return false;
 }
 
 // ── Hook implementation ───────────────────────────────────────────────────────
@@ -310,7 +384,7 @@ export function useVsDetail({
   const [intentReview, setIntentReview] = useState<ChallengeIntentReview | null>(null);
 
   const currentStakeAmount = Number.parseInt(challengeStake, 10);
-  const currentRevisionKey = buildRevisionKey(
+  const currentRevisionKey = buildChallengeRevisionKey(
     vs?.claim_statement ?? null,
     address,
     Number.isFinite(currentStakeAmount) ? currentStakeAmount : null
@@ -375,6 +449,11 @@ export function useVsDetail({
       setActivityLoading(false);
       setActivityError(null);
       setIntentReview(null);
+      viewerConfirmedInitializedRef.current = false;
+      prevViewerConfirmedRef.current = false;
+      lastAnnouncedKeyRef.current = null;
+      setChallengeResultState("idle");
+      setChallengeRefreshAnnouncement(null);
     }
     prevVsIdRef.current = vsId;
   }, [vsId]);
@@ -778,6 +857,75 @@ export function useVsDetail({
     }
   }, [address]);
 
+  // ── Screen-reader focus & announcement preservation ───────────────────────
+  //
+  // Track only relevant submitted or confirmed challenge transitions so routine
+  // background polls stay silent. The initial snapshot seeds the viewer's
+  // existing challenger membership without emitting a stale confirmation.
+  const viewerConfirmedInitializedRef = useRef(false);
+  const prevViewerConfirmedRef = useRef(false);
+  const lastAnnouncedKeyRef = useRef<string | null>(null);
+  const [challengeResultState, setChallengeResultState] =
+    useState<ChallengeResultState>("idle");
+  const [challengeRefreshAnnouncement, setChallengeRefreshAnnouncement] =
+    useState<ChallengeRefreshAnnouncement | null>(null);
+
+  useEffect(() => {
+    viewerConfirmedInitializedRef.current = false;
+    prevViewerConfirmedRef.current = false;
+    lastAnnouncedKeyRef.current = null;
+    setChallengeResultState("idle");
+    setChallengeRefreshAnnouncement(null);
+  }, [address]);
+
+  useEffect(() => {
+    const viewerConfirmedNow = isViewerChallenger(vs, address);
+    let hadViewerConfirmedBefore = prevViewerConfirmedRef.current;
+
+    if (vs !== null) {
+      if (!viewerConfirmedInitializedRef.current) {
+        // Seed from the first observed snapshot so opening an already-challenged
+        // market does not spuriously announce "confirmed".
+        viewerConfirmedInitializedRef.current = true;
+        hadViewerConfirmedBefore = viewerConfirmedNow;
+      }
+      prevViewerConfirmedRef.current = viewerConfirmedNow;
+    }
+
+    const derived = deriveChallengeResultState({
+      recovery: challengeRecovery,
+      viewerConfirmedOnChain: viewerConfirmedNow,
+      hadViewerConfirmedBefore,
+      vsId,
+    });
+
+    setChallengeResultState(derived.state);
+
+    const { announcement, nextLastAnnouncedKey } =
+      buildChallengeRefreshAnnouncement({
+        state: derived.state,
+        dedupeSubject: derived.dedupeSubject,
+        stakeAmount: derived.stakeAmount,
+        lastAnnouncedKey: lastAnnouncedKeyRef.current,
+      });
+
+    lastAnnouncedKeyRef.current = nextLastAnnouncedKey;
+    if (announcement) {
+      setChallengeRefreshAnnouncement(announcement);
+    } else if (derived.state === "idle") {
+      setChallengeRefreshAnnouncement(null);
+    }
+  }, [vs, address, challengeRecovery, vsId]);
+
+  const resolveFocusAfterRefresh = useCallback(
+    (
+      activeAction: ChallengeActionId | null,
+      survivingActions: readonly ChallengeActionId[]
+    ): ChallengeActionId | null =>
+      resolveSurvivingChallengeAction(activeAction, survivingActions),
+    []
+  );
+
   // ── Return ────────────────────────────────────────────────────────────────
 
   return {
@@ -802,5 +950,8 @@ export function useVsDetail({
     captureChallengeIntent,
     clearChallengeIntent,
     authorizationClearedFor,
+    challengeResultState,
+    challengeRefreshAnnouncement,
+    resolveFocusAfterRefresh,
   };
 }

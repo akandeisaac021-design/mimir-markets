@@ -23,6 +23,7 @@ npm run verify:release-readiness -- --json       # machine-readable report
 # A funded release also records the evidence for the gates that need a live
 # deployment, then runs the checklist in release mode:
 npm run verify:release-readiness -- --evidence evidence.json --mode=release
+npm run verify:release-readiness -- --manifest evidence-manifest.json --mode=release
 npm run verify:release-readiness -- --out release-record.json
 Production installs from the committed lockfile. `vercel.json` sets
 `installCommand` to `npm ci` - the same install CI runs - so a deploy cannot
@@ -189,6 +190,70 @@ offline-only.json (nothing recorded for the live gates — ready in develop
 mode, refused in release mode), failed-gate.json, unknown-gate.json,
 waived-gate.json, secret-shaped.json and empty-results.json.
 
+Revision-bound evidence manifest
+For a funded review, record a manifest so every gate result is bound to the
+same git revision. `--manifest <file>` requires this document; `--evidence`
+keeps accepting the legacy shape above and auto-detects a manifest when it sees
+the manifest `kind`.
+
+JSON
+
+{
+  "schemaVersion": 1,
+  "kind": "mimir-release-evidence-manifest",
+  "revision": "<full git SHA of the reviewed revision>",
+  "schemaIdentity": {
+    "readinessFingerprint": "<releaseReadinessFingerprint()>",
+    "schemaSnapshot": {
+      "schemaVersion": 1,
+      "hashAlgorithm": "sha256",
+      "source": "lib/db.ts",
+      "fingerprint": "<schemas/db-schema.snapshot.json fingerprint>"
+    },
+    "digest": "<sha256 of the canonical identity above>"
+  },
+  "commands": {
+    "deployment-verification": "npm run verify:deployment"
+  },
+  "artifacts": {
+    "deployment-verification": [
+      { "path": "evidence/verify-deployment.log", "sha256": "<sha256 of file bytes>" }
+    ]
+  },
+  "results": {
+    "deployment-verification": {
+      "status": "pass",
+      "revision": "<the same git SHA>",
+      "command": "npm run verify:deployment",
+      "detail": "on-chain owner, oracle, USDC SAC, fee policy and WASM hash all match"
+    }
+  }
+}
+
+Every release gate id must be present under `results`, including advisory
+gates. Every recorded result must repeat the manifest `revision` and the exact
+`command` declared by the registry (`commands` is checked too), and the
+manifest `schemaIdentity` must match the checked-out release readiness and
+schema snapshot identities. Mixed-revision results, omitted gates, a changed
+command or a stale schema identity are release-blocking findings.
+
+Artifact digests are sha256 over file bytes. Artifact `path` values are
+normalized, POSIX-style paths relative to an explicit evidence root (the
+repository root for the CLI). Absolute paths, `..` segments, duplicate or
+`.` segments, backslashes, and symlinks in any path component are refused
+before the file is read. Escaping or symlinked paths produce the deterministic
+finding `EVIDENCE_ARTIFACT_PATH_INVALID` with a reason (`parent-segment`,
+`symlink`, and so on); a missing file is `EVIDENCE_ARTIFACT_MISSING`, and a
+changed byte is `EVIDENCE_ARTIFACT_DIGEST_MISMATCH`. At least one artifact
+digest is required, and it must live under the root even when the digest
+matches an outside file.
+
+`--out` adds an `evidenceManifest` binding (revision, schema identity digest
+and artifact count) to the deterministic release record. Use
+`lib/ops/release-evidence-manifest.ts` (`buildReleaseEvidenceManifest`,
+`evaluateReleaseEvidenceManifest`, `resolveEvidenceArtifactPath`) to produce
+and verify the same document offline.
+
 Failure, rollback and operational impact of the checklist itself
 Failure. The CLI exits non-zero and prints the failing gate, the reason
 and the gate's rollback note. It never prints evidence text or environment
@@ -213,11 +278,15 @@ Tests
 Bash
 
 node --import tsx --test tests/node/release-readiness.test.ts
-Coverage: positive (a fully evidenced release is ready), negative (unknown gate
-ids, non-pass/fail statuses, waiver keys and empty records are refused),
-failure (a failed gate and a secret-shaped detail both fail closed) and
-regression (the fingerprint, the documented gate list, the npm scripts, the
-declared paths and the CI wiring).
+node --import tsx --test tests/node/release-evidence-manifest.test.ts
+Coverage: positive (a fully evidenced release is ready, and a revision-bound
+manifest with verified artifact digests is ready), negative (unknown gate ids,
+non-pass/fail statuses, waiver keys and empty records are refused; mixed
+revisions, missing results, changed commands, stale schema identity and digest
+mismatches fail closed), failure (a failed gate, a secret-shaped detail, and
+escaping or symlinked artifact paths both fail closed) and regression (the
+fingerprint, the documented gate list, the npm scripts, the declared paths and
+the CI wiring).
 
 The CI tier matrix that decides which of these gates run for a given change is
 documented in [docs/CI_PATH_SCOPES.md](./CI_PATH_SCOPES.md), including the

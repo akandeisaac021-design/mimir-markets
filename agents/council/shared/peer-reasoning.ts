@@ -13,18 +13,19 @@
  */
 
 import { createHash } from "node:crypto";
-import { fetchWithBudget, payingWalletFor, type PayingWallet } from "../../../lib/x402/buyer";
+import type { PayingWallet } from "../../../lib/x402/buyer";
 import { outboundTraceHeaders } from "../../../lib/ops/trace-http";
-import { getCouncilWallet } from "../../../lib/agent-wallets";
 import {
   BallotCommitmentError,
   COUNCIL_BALLOT_COMMITMENT_VERSION,
   createBallotCommitment,
+  formatAgreementWithSampleSize,
   verifyBallotCommitment,
   type BallotCommitmentFailureReason,
   type BallotCommitmentVerification,
   type BallotParticipantIdentity,
   type BallotParticipantInput,
+  type CouncilAgreementStatus,
   type CouncilBallotCommitment,
 } from "../../../lib/council/quorum";
 import { usdcToUnits } from "../../../lib/usdc";
@@ -910,9 +911,13 @@ export function verifyPeerReasoningCommitment(
   };
 }
 
-function payingWalletForPersona(persona: PersonaSpec): PayingWallet | null {
+async function payingWalletForPersona(persona: PersonaSpec): Promise<PayingWallet | null> {
   if (!process.env[personaSecretEnv(persona)]) return null;
   try {
+    const [{ getCouncilWallet }, { payingWalletFor }] = await Promise.all([
+      import("../../../lib/agent-wallets"),
+      import("../../../lib/x402/buyer"),
+    ]);
     return payingWalletFor(getCouncilWallet(persona.slug));
   } catch {
     return null;
@@ -939,23 +944,190 @@ export interface CouncilPolicy {
 export interface PolicyDecision {
   policy: string;
   decision: "yes" | "no" | "undecided";
+  /** Valid eligible votes counted as the denominator (`n`) for this policy. */
+  sampleSize: number;
+  /** Agreement percentage (0..100) among valid eligible votes, or `null` when ballot is absent. */
+  agreementPct: number | null;
+  /** Display string pairing agreement percentage with sample size (or absent ballot label). */
+  agreementDisplay: string;
+}
+
+export interface PeerBallotAgreementSummary {
+  status: CouncilAgreementStatus;
+  /** Valid eligible votes used as the denominator (`n`). */
+  sampleSize: number;
+  /** Valid eligible votes agreeing with `verdict` (0 when absent or none match). */
+  agreeingVotes: number;
+  /** Integer percentage 0..100 when measured, or `null` when ballot is absent. */
+  agreementPct: number | null;
+  /** Target or leading decisive verdict (`"yes"` | `"no"`), or `null` when absent/tied/non-decisive. */
+  verdict: "yes" | "no" | null;
+  /** Total ballots inspected before filtering to valid eligible votes. */
+  totalAttempts: number;
+  /** Ballots excluded from the denominator (invalid, duplicate, ineligible, or below minConfidence). */
+  excludedCount: number;
+  /** Formatted string pairing agreement percentage with sample size (or absent ballot label). */
+  display: string;
+}
+
+export interface PeerBallotAgreementOptions {
+  /** Optional set of eligible persona slugs (case-insensitive). */
+  eligiblePersonas?: readonly string[];
+  /** Minimum confidence threshold for a vote to be eligible (defaults to 0). */
+  minConfidence?: number;
+  /** Optional target verdict (`"yes"` | `"no"`) to measure agreement against. */
+  targetVerdict?: "yes" | "no";
+}
+
+function isCapturedVerdict(v: unknown): v is CapturedBallot["verdict"] {
+  return v === "yes" || v === "no" || v === "abstain";
+}
+
+/**
+ * Summarize agreement percentage alongside sample size for captured peer
+ * ballots, using only valid eligible votes as the denominator.
+ *
+ * Invalid, duplicate, ineligible, or below-confidence entries are excluded
+ * from the denominator. When no valid eligible votes remain (`sampleSize === 0`),
+ * `status` is `"absent_ballot"` and `agreementPct` is `null` (displayed as
+ * `"No ballot (n=0)"`) rather than `0%`.
+ */
+export function summarizePeerBallotAgreement(
+  ballots: readonly CapturedBallot[],
+  opts?: PeerBallotAgreementOptions,
+): PeerBallotAgreementSummary {
+  const eligibleSet =
+    opts?.eligiblePersonas !== undefined
+      ? new Set(opts.eligiblePersonas.map((s) => normalizeSlug(s)).filter(Boolean))
+      : null;
+  const minConfidence =
+    typeof opts?.minConfidence === "number" && Number.isFinite(opts.minConfidence)
+      ? opts.minConfidence
+      : 0;
+
+  const seenPersonas = new Set<string>();
+  const validEligible: CapturedBallot[] = [];
+
+  for (const b of ballots) {
+    const slug = normalizeSlug(b?.persona);
+    if (!slug) continue;
+    if (seenPersonas.has(slug)) continue;
+    if (eligibleSet !== null && !eligibleSet.has(slug)) continue;
+    if (!isCapturedVerdict(b?.verdict)) continue;
+    if (typeof b?.confidence !== "number" || !Number.isFinite(b.confidence)) continue;
+    if (b.confidence < 0 || b.confidence > 100) continue;
+    if (b.confidence < minConfidence) continue;
+    seenPersonas.add(slug);
+    validEligible.push(b);
+  }
+
+  const sampleSize = validEligible.length;
+  const totalAttempts = ballots.length;
+  const excludedCount = Math.max(0, totalAttempts - sampleSize);
+
+  if (sampleSize === 0) {
+    return {
+      status: "absent_ballot",
+      sampleSize: 0,
+      agreeingVotes: 0,
+      agreementPct: null,
+      verdict: null,
+      totalAttempts,
+      excludedCount,
+      display: "No ballot (n=0)",
+    };
+  }
+
+  let agreeingVotes = 0;
+  let verdict: "yes" | "no" | null = null;
+
+  if (opts?.targetVerdict !== undefined) {
+    verdict = opts.targetVerdict;
+    agreeingVotes = validEligible.filter((b) => b.verdict === opts.targetVerdict).length;
+  } else {
+    const yes = validEligible.filter((b) => b.verdict === "yes").length;
+    const no = validEligible.filter((b) => b.verdict === "no").length;
+    if (yes === 0 && no === 0) {
+      agreeingVotes = 0;
+      verdict = null;
+    } else if (yes > no) {
+      agreeingVotes = yes;
+      verdict = "yes";
+    } else if (no > yes) {
+      agreeingVotes = no;
+      verdict = "no";
+    } else {
+      agreeingVotes = yes;
+      verdict = null;
+    }
+  }
+
+  const agreementPct = Math.round((agreeingVotes / sampleSize) * 100);
+  const status: CouncilAgreementStatus = "measured";
+  return {
+    status,
+    sampleSize,
+    agreeingVotes,
+    agreementPct,
+    verdict,
+    totalAttempts,
+    excludedCount,
+    display: formatAgreementWithSampleSize({ status, agreementPct, agreeingVotes, sampleSize }),
+  };
 }
 
 export function runPolicyComparison(
   ballots: CapturedBallot[],
   policies: CouncilPolicy[],
+  opts?: { eligiblePersonas?: readonly string[] },
 ): PolicyDecision[] {
   return policies.map((policy) => {
-    const counted = ballots.filter(
-      (b) => b.verdict !== "abstain" && b.confidence >= policy.minConfidence,
-    );
+    const summary = summarizePeerBallotAgreement(ballots, {
+      eligiblePersonas: opts?.eligiblePersonas,
+      minConfidence: policy.minConfidence,
+    });
+    const eligibleSet =
+      opts?.eligiblePersonas !== undefined
+        ? new Set(opts.eligiblePersonas.map((s) => normalizeSlug(s)).filter(Boolean))
+        : null;
+    const seen = new Set<string>();
+    const counted = ballots.filter((b) => {
+      const slug = normalizeSlug(b?.persona);
+      if (!slug || seen.has(slug)) return false;
+      if (eligibleSet !== null && !eligibleSet.has(slug)) return false;
+      if (!isCapturedVerdict(b?.verdict)) return false;
+      if (typeof b?.confidence !== "number" || !Number.isFinite(b.confidence)) return false;
+      if (b.confidence < 0 || b.confidence > 100 || b.confidence < policy.minConfidence) return false;
+      seen.add(slug);
+      return b.verdict !== "abstain";
+    });
     if (counted.length < policy.quorum) {
-      return { policy: policy.name, decision: "undecided" as const };
+      return {
+        policy: policy.name,
+        decision: "undecided" as const,
+        sampleSize: summary.sampleSize,
+        agreementPct: summary.agreementPct,
+        agreementDisplay: summary.display,
+      };
     }
     const yes = counted.filter((b) => b.verdict === "yes").length;
     const no = counted.length - yes;
-    if (yes === no) return { policy: policy.name, decision: "undecided" as const };
-    return { policy: policy.name, decision: yes > no ? ("yes" as const) : ("no" as const) };
+    if (yes === no) {
+      return {
+        policy: policy.name,
+        decision: "undecided" as const,
+        sampleSize: summary.sampleSize,
+        agreementPct: summary.agreementPct,
+        agreementDisplay: summary.display,
+      };
+    }
+    return {
+      policy: policy.name,
+      decision: yes > no ? ("yes" as const) : ("no" as const),
+      sampleSize: summary.sampleSize,
+      agreementPct: summary.agreementPct,
+      agreementDisplay: summary.display,
+    };
   });
 }
 
@@ -1067,7 +1239,7 @@ export async function buyPeerReasoning(args: {
             : {}),
         ...(body.recordedAtMs !== undefined ? { recordedAtMs: body.recordedAtMs } : {}),
         ...(body.alteredAtMs !== undefined ? { alteredAtMs: body.alteredAtMs } : {}),
-      };
+      });
 
       reads.push(readEntry);
 

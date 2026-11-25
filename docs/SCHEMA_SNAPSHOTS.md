@@ -66,6 +66,7 @@ remediation command. They never include row data, addresses, or secrets.
 ## Offline rollback readiness report
 
 `npm run report:rollback-readiness` reuses the snapshot checks above to state the schema assumptions a rollback makes (committed snapshot present, source schema matches it, migration versions unique, migrations registered) next to the pinned Wasm digests and rollback runbooks, and lists the blockers it observed. Drift is an error in both modes; it never writes the snapshot or touches a database. See `docs/ROLLBACK.md`.
+The funded-release evidence manifest (`npm run verify:release-readiness -- --manifest <file>`) also pins this snapshot's `schemaVersion`, `hashAlgorithm`, `source` and `fingerprint`, together with the release readiness fingerprint, in its `schemaIdentity`. A manifest recorded before a schema snapshot change is refused with `EVIDENCE_SCHEMA_IDENTITY_MISMATCH`; regenerate it on the released revision.
 
 ## Release, rollback, artifact, and environment
 

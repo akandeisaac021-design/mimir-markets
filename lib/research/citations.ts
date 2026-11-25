@@ -96,6 +96,41 @@ export interface BuildResearchCitationsOptions {
   nowMs?: number;
   /** When true, treat the whole list as cancelled (e.g. cancelled market). */
   cancelled?: boolean;
+  /**
+   * Binds the rows to the market and source revision they were fetched for.
+   * When `resultScope` is given and does not match `currentScope`, the result
+   * is stale (the selected market or its sources changed while the fetch was
+   * in flight) and the view is reported as `cancelled` with no rows, so one
+   * market's evidence never renders under another market's header. Omit both
+   * to keep the previous, unbound behavior.
+   */
+  currentScope?: CitationScope | null;
+  resultScope?: CitationScope | null;
+}
+
+/** The market (and optional source revision) a citation result belongs to. */
+export interface CitationScope {
+  marketId: string | number;
+  /** Source revision, e.g. a context-pack hash or `updatedAt`; null when unknown. */
+  revision?: string | number | null;
+}
+
+function scopeKey(scope: CitationScope): string {
+  return `${String(scope.marketId)}\u0000${scope.revision == null ? "" : String(scope.revision)}`;
+}
+
+/**
+ * True when a fetched citation result still belongs to the selected market and
+ * source revision. A missing result scope (legacy callers) counts as current;
+ * a result scope with no current scope does not, because nothing is selected.
+ */
+export function isCitationScopeCurrent(
+  currentScope: CitationScope | null | undefined,
+  resultScope: CitationScope | null | undefined,
+): boolean {
+  if (resultScope == null) return true;
+  if (currentScope == null) return false;
+  return scopeKey(currentScope) === scopeKey(resultScope);
 }
 
 const WALLET_LIKE =
@@ -160,6 +195,53 @@ function trustRank(tier: CitationTrustTier): number {
     default:
       return 3;
   }
+}
+
+/**
+ * Canonical identity of a source: the content digest when the producer supplied
+ * one, otherwise the normalized URL. Array position is deliberately excluded —
+ * it only records how asynchronous fetches happened to settle, so two callers
+ * that received the same sources in a different order must still agree.
+ */
+export function citationSourceIdentity(
+  row: Pick<ResearchCitationView, "contentHash" | "url">,
+): string {
+  return row.contentHash || row.url.toLowerCase();
+}
+
+/**
+ * Display order for citations, independent of arrival order:
+ *
+ *   1. trust tier — primary, then corroborating, unverified, unknown;
+ *   2. most recent capture first (sources with no known capture time last —
+ *      an unknown age is never presented as the freshest);
+ *   3. canonical source identity ({@link citationSourceIdentity}) as the
+ *      tie-breaker, so equal capture times never fall back to input order;
+ *   4. domain, then `id` only to separate rows a reader cannot tell apart.
+ *
+ * This is a total order over the visible fields, so a shuffled response cannot
+ * reorder the panel.
+ */
+export function compareCitations(
+  a: ResearchCitationView,
+  b: ResearchCitationView,
+): number {
+  const trust = trustRank(a.trustTier) - trustRank(b.trustTier);
+  if (trust !== 0) return trust;
+
+  if (a.capturedAt !== b.capturedAt) {
+    if (a.capturedAt == null) return 1;
+    if (b.capturedAt == null) return -1;
+    return b.capturedAt - a.capturedAt;
+  }
+
+  const identity = citationSourceIdentity(a).localeCompare(citationSourceIdentity(b));
+  if (identity !== 0) return identity;
+
+  const domain = a.domain.localeCompare(b.domain);
+  if (domain !== 0) return domain;
+
+  return a.id.localeCompare(b.id);
 }
 
 /**
@@ -256,9 +338,11 @@ export function buildResearchCitations(
     maxAgeSeconds = null,
     nowMs = Date.now(),
     cancelled = false,
+    currentScope = null,
+    resultScope = null,
   } = options;
 
-  if (cancelled) {
+  if (cancelled || !isCitationScopeCurrent(currentScope, resultScope)) {
     return {
       status: "cancelled",
       statusMessageKey: "cancelled",
@@ -411,12 +495,9 @@ export function buildResearchCitations(
     });
   }
 
-  // Prefer primary / earlier rows when collapsing duplicates.
-  const ranked = [...prepared].sort((a, b) => {
-    const trust = trustRank(a.trustTier) - trustRank(b.trustTier);
-    if (trust !== 0) return trust;
-    return a.id.localeCompare(b.id);
-  });
+  // Collapse duplicates in the same canonical order the panel uses: primary
+  // first, then newest capture, then canonical identity. Never arrival order.
+  const ranked = [...prepared].sort(compareCitations);
 
   const seenHash = new Map<string, string>();
   const seenUrl = new Map<string, string>();
@@ -456,16 +537,10 @@ export function buildResearchCitations(
     citations.push(row);
   }
 
-  // Restore input-ish order for display: primary first already from sort, then
-  // keep stable by original index embedded in id suffix.
-  citations.sort((a, b) => {
-    const trust = trustRank(a.trustTier) - trustRank(b.trustTier);
-    if (trust !== 0) return trust;
-    const ai = Number(a.id.split(":").pop());
-    const bi = Number(b.id.split(":").pop());
-    if (Number.isFinite(ai) && Number.isFinite(bi) && ai !== bi) return ai - bi;
-    return a.id.localeCompare(b.id);
-  });
+  // Canonical display order. Equal capture times are broken by source identity
+  // rather than the index embedded in `id`, so an async response that arrives in
+  // a different order renders the same list.
+  citations.sort(compareCitations);
 
   const displayable = citations.filter(
     (row) =>

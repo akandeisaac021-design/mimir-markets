@@ -202,6 +202,16 @@ waived, skipped or bypassed.
 Privacy: a recorded detail/artifact that looks like a credential
 (Stellar seed, sk-/rk- key, gh*_ token, phc_ key, AKIA key, PEM
 private key, or a URL with embedded credentials) is refused, not redacted.
+Funded review uses `--manifest <file>` (`lib/ops/release-evidence-manifest.ts`)
+to bind every gate result, the exact check command, an artifact sha256 digest
+and the readiness/schema-snapshot identity to one git revision. Mixed revisions,
+missing gate results, changed commands, stale schema identity and digest
+mismatches fail closed. Legacy `--evidence` JSON still works and auto-detects a
+manifest by its `kind`.
+Artifact paths are normalized, POSIX-style paths relative to an explicit root
+(the repository root for the CLI). Absolute paths, `..` segments, backslashes
+and symlinks in any component are refused before reading, with the actionable
+deterministic code `EVIDENCE_ARTIFACT_PATH_INVALID`.
 Changing a gate: update lib/ops/release-readiness.ts and
 docs/RELEASE_READINESS.md in the same pull request. The CLI fails when the
 doc stops describing a gate id or its command, and

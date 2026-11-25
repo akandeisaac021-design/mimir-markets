@@ -112,9 +112,28 @@ For autonomous trader staking, `tests/node/trader-outage-fixtures.ts` provides a
 - **Horizon/RPC outages**: verifies provider read failures release in-flight exposure without corrupting sequence state.
 - **Stale sequences (`tx_bad_seq`)**: verifies out-of-band ledger advances trigger `resync()` and retry cleanly within authorized limits.
 - **Late submission results**: verifies delayed settlements hold in-flight exposure until settled, preventing concurrent over-allocation, and handle out-of-order sequence holes and incident `pause()`/`resume()` cleanly.
+- **Network configuration changes**: `SequenceManager` binds sequence reservations to the selected Stellar network (and optional passphrase), rejecting reservation reuse after network drift (`SequenceNetworkMismatchError`) while keeping reservations for different accounts independent (verified in `tests/node/agent-sequence-manager.test.ts`).
 
 Run the focused suite with:
 
 ```bash
 node --import tsx --test tests/node/trader-outage-sequence-race.test.ts
+```
+
+---
+
+## Challenge UX observation and submission fixtures
+
+For market detail and challenge ticket flows, `tests/node/challenge-ux-fixtures.ts` provides a deterministic offline harness (`FakeChallengeObservationTransport`, `FakeChallengeWallet`, and `ChallengeUxFixtureHarness`) that runs without live wallets, funded accounts, or network access. It exercises the pure revision and state interfaces in `hooks/useVsDetail.ts` (`buildChallengeRevisionKey`, `isChallengeIntentReviewValid`), `components/vs/CreateChallengeTicket.tsx` (`computeChallengeTicketRevision`), `lib/vs-detail-state.ts`, `lib/market-expiry.ts`, `lib/challenge-recovery.ts`, and `lib/wallet-submission-recovery.ts`:
+
+- **Late observations**: verifies monotonic fetch generation guards drop out-of-order responses and errors while preserving user-entered integer USDC stakes.
+- **Conflicting observations**: verifies stale Postgres read-index snapshots, aged observations, clock skew, challenge lock windows, and authoritative Soroban contract state transitions gate eligibility conservatively.
+- **Stale market revisions**: verifies claim statement updates, stake edits, and wallet account switches invalidate captured intent reviews and ticket revision digests until re-confirmed.
+- **Wallet rejections**: verifies user-declined signatures and definitive ledger rejections leave no recovery lock, preserve the user's draft stake, and permit immediate retry.
+- **Uncertain submissions**: verifies timeout/unwrap errors carrying a transaction hash persist recovery state across simulated reloads, block duplicate stakes, fail closed when the bounded status-check budget is exhausted, and reconcile cleanly on late on-chain confirmation or failure without resubmitting.
+
+Run the focused suite with:
+
+```bash
+node --import tsx --test tests/node/challenge-ux-fixtures.test.ts
 ```
